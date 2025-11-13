@@ -33,50 +33,49 @@ class FormationManager:
         return bonuses.get(position, {})
     
     @staticmethod
-    def calculate_chemistry_links(team_data: Dict) -> int:
+    def calculate_chemistry_links(team_data: Dict, formation_key: str) -> int:
         """
         Calculate team chemistry based on player links
         team_data should be: {position: card_object}
         """
-        chemistry = 0
-        positions = list(team_data.keys())
+        formation = config.FORMATIONS.get(formation_key)
+        if not formation:
+            return 0
         
-        # Define position adjacencies (which positions are linked)
-        adjacencies = {
-            'GK': ['LCB', 'RCB'],
-            'LB': ['LCB', 'LCM'],
-            'LCB': ['GK', 'LB', 'RCB', 'CDM'],
-            'RCB': ['GK', 'RB', 'LCB', 'CDM'],
-            'RB': ['RCB', 'RCM'],
-            'CDM': ['LCB', 'RCB', 'LCM', 'RCM', 'CAM'],
-            'LCM': ['LB', 'CDM', 'LW', 'CAM'],
-            'RCM': ['RB', 'CDM', 'RW', 'CAM'],
-            'CAM': ['CDM', 'LCM', 'RCM', 'ST', 'LW', 'RW'],
-            'LW': ['LCM', 'CAM', 'ST'],
-            'ST': ['CAM', 'LW', 'RW'],
-            'RW': ['RCM', 'CAM', 'ST']
-        }
+        formation_positions = formation.get('positions', {})
+        position_names = [pos for pos in team_data.keys() if pos in formation_positions]
+        
+        chemistry = 0
+        
+        def are_adjacent(pos_a: str, pos_b: str) -> bool:
+            coord_a = formation_positions.get(pos_a)
+            coord_b = formation_positions.get(pos_b)
+            if not coord_a or not coord_b:
+                return False
+            x_diff = abs(coord_a[0] - coord_b[0])
+            y_diff = abs(coord_a[1] - coord_b[1])
+            return x_diff <= 2 and y_diff <= 2
         
         # Check chemistry between adjacent players
-        for pos1 in positions:
+        for idx, pos1 in enumerate(position_names):
             card1 = team_data[pos1]
-            adjacent_positions = adjacencies.get(pos1, [])
-            
-            for pos2 in adjacent_positions:
-                if pos2 in team_data:
-                    card2 = team_data[pos2]
-                    
-                    # Same club: +2 chemistry
-                    if card1.club and card2.club and card1.club == card2.club:
-                        chemistry += 2
-                    
-                    # Same nation: +1 chemistry
-                    if card1.nation and card2.nation and card1.nation == card2.nation:
-                        chemistry += 1
-                    
-                    # Same league: +1 chemistry
-                    if card1.league and card2.league and card1.league == card2.league:
-                        chemistry += 1
+            for pos2 in position_names[idx + 1:]:
+                if not are_adjacent(pos1, pos2):
+                    continue
+                
+                card2 = team_data[pos2]
+                
+                # Same club: +2 chemistry
+                if card1.club and card2.club and card1.club == card2.club:
+                    chemistry += 2
+                
+                # Same nation: +1 chemistry
+                if card1.nation and card2.nation and card1.nation == card2.nation:
+                    chemistry += 1
+                
+                # Same league: +1 chemistry
+                if card1.league and card2.league and card1.league == card2.league:
+                    chemistry += 1
         
         return chemistry
     
@@ -116,7 +115,7 @@ class FormationManager:
         avg_rating = total_rating // player_count
         
         # Add chemistry bonus (every 10 chemistry = +1 OVR)
-        chemistry = FormationManager.calculate_chemistry_links(team_data)
+        chemistry = FormationManager.calculate_chemistry_links(team_data, formation_key)
         chemistry_bonus = chemistry // 10
         
         # Add logo bonus

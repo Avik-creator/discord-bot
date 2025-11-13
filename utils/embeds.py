@@ -104,12 +104,29 @@ class EmbedBuilder:
         
         # Show positions
         positions_text = []
-        for position in ['GK', 'LB', 'LCB', 'RCB', 'RB', 'CDM', 'LCM', 'RCM', 'CAM', 'LW', 'ST', 'RW']:
-            if position in team_slots and team_slots[position]:
-                card = team_slots[position]
+        ordered_positions = []
+        if formation:
+            ordered_positions = sorted(
+                formation['positions'].items(),
+                key=lambda item: (item[1][1], item[1][0])
+            )
+        else:
+            ordered_positions = [(pos, None) for pos in sorted(team_slots.keys())]
+        
+        seen_positions = set()
+        for position, _ in ordered_positions:
+            seen_positions.add(position)
+            card = team_slots.get(position)
+            if card:
                 positions_text.append(f"**{position}**: {card.name} ({card.overall_rating} OVR)")
             else:
                 positions_text.append(f"**{position}**: Empty")
+        
+        # Include any extra positions not defined in the formation (fallback)
+        extra_positions = [pos for pos in sorted(team_slots.keys()) if pos not in seen_positions]
+        for position in extra_positions:
+            card = team_slots[position]
+            positions_text.append(f"**{position}**: {card.name} ({card.overall_rating} OVR)")
         
         embed.add_field(name="Players", value="\n".join(positions_text), inline=False)
         

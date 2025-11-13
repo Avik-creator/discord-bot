@@ -63,13 +63,6 @@ class TeamCog(commands.Cog):
     
     @app_commands.command(name="select", description="Select your team formation")
     @app_commands.describe(lineup="Choose your formation")
-    @app_commands.choices(lineup=[
-        app_commands.Choice(name="4-3-3 Attack", value="433_attack"),
-        app_commands.Choice(name="4-3-3 Defense", value="433_defense"),
-        app_commands.Choice(name="4-4-2 Diamond", value="442_diamond"),
-        app_commands.Choice(name="4-2-4", value="424"),
-        app_commands.Choice(name="3-4-3 Diamond", value="343_diamond"),
-    ])
     async def select_lineup(self, interaction: discord.Interaction, lineup: str):
         """Select team formation"""
         async with AsyncSessionLocal() as session:
@@ -85,11 +78,17 @@ class TeamCog(commands.Cog):
                 )
                 return
             
+            formation = FormationManager.get_formation(lineup)
+            if not formation:
+                await interaction.response.send_message(
+                    "Formation data is not available yet. Please choose a different lineup.",
+                    ephemeral=True
+                )
+                return
+            
             # Update formation
             team.formation = lineup
             await session.commit()
-            
-            formation = FormationManager.get_formation(lineup)
             
             embed = discord.Embed(
                 title="⚽ Formation Selected!",
@@ -106,6 +105,33 @@ class TeamCog(commands.Cog):
             )
             
             await interaction.response.send_message(embed=embed)
+
+    @select_lineup.autocomplete('lineup')
+    async def lineup_autocomplete(self, interaction: discord.Interaction, current: str):
+        """Autocomplete formations based on available configurations"""
+        del interaction  # Unused
+        query = (current or "").lower()
+        formations = sorted(
+            config.FORMATIONS.items(),
+            key=lambda item: item[1]['name']
+        )
+        
+        suggestions = []
+        for key, data in formations:
+            name = data['name']
+            if query and query not in name.lower():
+                continue
+            suggestions.append(app_commands.Choice(name=name, value=key))
+            if len(suggestions) == 25:
+                break
+        
+        if not suggestions:
+            suggestions = [
+                app_commands.Choice(name=data['name'], value=key)
+                for key, data in formations[:25]
+            ]
+        
+        return suggestions
     
     @app_commands.command(name="team", description="View your current team")
     async def view_team(self, interaction: discord.Interaction):
