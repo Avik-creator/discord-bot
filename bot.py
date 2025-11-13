@@ -7,6 +7,7 @@ from database.models import ServerConfig
 from utils.card_spawner import CardSpawner
 from sqlalchemy import select
 import config
+from api_server import app
 
 # Setup logging
 logging.basicConfig(
@@ -170,6 +171,24 @@ class FootballCardBot(commands.Bot):
                     ephemeral=True
                 )
 
+def run_api_server():
+    """Run the FastAPI server in a separate thread"""
+    import threading
+    import uvicorn
+    
+    def start_server():
+        uvicorn.run(
+            app,
+            host=config.API_SERVER_HOST,
+            port=config.API_SERVER_PORT,
+            log_level="info"
+        )
+    
+    thread = threading.Thread(target=start_server, daemon=True)
+    thread.start()
+    logger.info(f"API server starting on {config.API_SERVER_HOST}:{config.API_SERVER_PORT}")
+    return thread
+
 def main():
     """Main entry point"""
     # Check if token is set
@@ -177,7 +196,10 @@ def main():
         logger.error("DISCORD_BOT_TOKEN not set in environment variables!")
         return
     
-    # Create and run bot
+    # Start API server in background thread
+    api_thread = run_api_server()
+    
+    # Create and run bot (blocking)
     bot = FootballCardBot()
     
     try:

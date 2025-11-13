@@ -25,6 +25,10 @@ SPAWN_MESSAGE_MIN = int(os.getenv('SPAWN_MESSAGE_MIN', '20'))
 SPAWN_MESSAGE_MAX = int(os.getenv('SPAWN_MESSAGE_MAX', '50'))
 CATCH_TIMEOUT_SECONDS = int(os.getenv('CATCH_TIMEOUT_SECONDS', '180'))
 
+# API Server Configuration
+API_SERVER_HOST = os.getenv('API_SERVER_HOST', '0.0.0.0')
+API_SERVER_PORT = int(os.getenv('API_SERVER_PORT', '8000'))
+
 # Game Constants
 VALID_POSITIONS = [
     'GK',
