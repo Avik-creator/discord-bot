@@ -47,6 +47,7 @@ class Card(Base):
     __tablename__ = 'cards'
     
     id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(50), unique=True, nullable=True)
     api_player_id = Column(Integer, nullable=True)  # API-Football player ID
     name = Column(String(255), nullable=False, index=True)
     position = Column(String(10), nullable=False)

@@ -7,6 +7,7 @@ import sys
 from database.database import AsyncSessionLocal, init_db
 from database.models import Card, Logo, LogoRarity, CardType
 from utils.api_football import APIFootball
+from data.card_catalog import iter_all_cards
 import random
 
 async def create_sample_logos(session):
@@ -39,95 +40,32 @@ async def create_sample_logos(session):
 
 async def create_sample_cards(session):
     """Create sample cards if API-Football is not available"""
-    sample_players = [
-        # Top tier players
-        ("Lionel Messi", "RW", 93, 95, 45, "Inter Miami", "Argentina", "MLS", CardType.ICON),
-        ("Cristiano Ronaldo", "ST", 91, 93, 50, "Al Nassr", "Portugal", "Saudi Pro League", CardType.ICON),
-        ("Kylian Mbappé", "ST", 92, 96, 48, "Real Madrid", "France", "La Liga", CardType.BASE),
-        ("Erling Haaland", "ST", 91, 94, 46, "Manchester City", "Norway", "Premier League", CardType.BASE),
-        ("Kevin De Bruyne", "CAM", 91, 92, 72, "Manchester City", "Belgium", "Premier League", CardType.BASE),
-        
-        # High tier players
-        ("Vinícius Jr", "LW", 89, 93, 50, "Real Madrid", "Brazil", "La Liga", CardType.BASE),
-        ("Mohamed Salah", "RW", 89, 92, 58, "Liverpool", "Egypt", "Premier League", CardType.BASE),
-        ("Harry Kane", "ST", 89, 90, 60, "Bayern Munich", "England", "Bundesliga", CardType.BASE),
-        ("Bukayo Saka", "RW", 87, 90, 65, "Arsenal", "England", "Premier League", CardType.BASE),
-        ("Jude Bellingham", "CAM", 88, 85, 75, "Real Madrid", "England", "La Liga", CardType.BASE),
-        
-        # Midfielders
-        ("Luka Modrić", "RCM", 87, 75, 85, "Real Madrid", "Croatia", "La Liga", CardType.ICON),
-        ("Rodri", "CDM", 88, 70, 90, "Manchester City", "Spain", "Premier League", CardType.BASE),
-        ("Joshua Kimmich", "CDM", 88, 72, 88, "Bayern Munich", "Germany", "Bundesliga", CardType.BASE),
-        ("Bruno Fernandes", "CAM", 87, 86, 75, "Manchester United", "Portugal", "Premier League", CardType.BASE),
-        ("Martin Ødegaard", "CAM", 87, 88, 74, "Arsenal", "Norway", "Premier League", CardType.BASE),
-        
-        # Defenders
-        ("Virgil van Dijk", "RCB", 89, 60, 92, "Liverpool", "Netherlands", "Premier League", CardType.BASE),
-        ("Rúben Dias", "RCB", 88, 55, 90, "Manchester City", "Portugal", "Premier League", CardType.BASE),
-        ("Antonio Rüdiger", "LCB", 87, 58, 89, "Real Madrid", "Germany", "La Liga", CardType.BASE),
-        ("Trent Alexander-Arnold", "RB", 87, 82, 80, "Liverpool", "England", "Premier League", CardType.BASE),
-        ("Andrew Robertson", "LB", 86, 75, 85, "Liverpool", "Scotland", "Premier League", CardType.BASE),
-        
-        # Goalkeepers
-        ("Thibaut Courtois", "GK", 89, 10, 92, "Real Madrid", "Belgium", "La Liga", CardType.BASE),
-        ("Alisson", "GK", 89, 10, 91, "Liverpool", "Brazil", "Premier League", CardType.BASE),
-        ("Ederson", "GK", 88, 10, 90, "Manchester City", "Brazil", "Premier League", CardType.BASE),
-        ("Marc-André ter Stegen", "GK", 88, 10, 90, "Barcelona", "Germany", "La Liga", CardType.BASE),
-        
-        # More variety
-        ("Pedri", "LCM", 86, 82, 78, "Barcelona", "Spain", "La Liga", CardType.BASE),
-        ("Gavi", "LCM", 85, 80, 76, "Barcelona", "Spain", "La Liga", CardType.BASE),
-        ("Phil Foden", "CAM", 87, 88, 70, "Manchester City", "England", "Premier League", CardType.BASE),
-        ("Bernardo Silva", "RCM", 88, 86, 76, "Manchester City", "Portugal", "Premier League", CardType.BASE),
-        ("Federico Valverde", "RCM", 87, 82, 82, "Real Madrid", "Uruguay", "La Liga", CardType.BASE),
-        ("Declan Rice", "CDM", 86, 68, 86, "Arsenal", "England", "Premier League", CardType.BASE),
-    ]
+    type_map = {
+        "base": CardType.BASE,
+        "icon": CardType.ICON,
+        "event": CardType.EVENT,
+    }
     
-    # Add Event cards (TOTW examples)
-    event_players = [
-        ("TOTW Mbappé", "ST", 94, 98, 50, "Real Madrid", "France", "La Liga", CardType.EVENT, "TOTW"),
-        ("TOTW Salah", "RW", 91, 94, 60, "Liverpool", "Egypt", "Premier League", CardType.EVENT, "TOTW"),
-        ("TOTS Haaland", "ST", 95, 97, 48, "Manchester City", "Norway", "Premier League", CardType.EVENT, "TOTS"),
-        ("TOTS De Bruyne", "CAM", 94, 95, 75, "Manchester City", "Belgium", "Premier League", CardType.EVENT, "TOTS"),
-        ("UCL Vinícius", "LW", 91, 95, 52, "Real Madrid", "Brazil", "La Liga", CardType.EVENT, "UCL"),
-    ]
-    
-    all_players = sample_players + [(name, pos, ovr, att, def, club, nat, league, card_type, event) 
-                                    for name, pos, ovr, att, def, club, nat, league, card_type, event 
-                                    in [(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]) 
-                                        for p in event_players]]
-    
-    for player_data in sample_players:
+    created = 0
+    for definition in iter_all_cards():
         card = Card(
-            name=player_data[0],
-            position=player_data[1],
-            overall_rating=player_data[2],
-            attack_stat=player_data[3],
-            defense_stat=player_data[4],
-            club=player_data[5],
-            nation=player_data[6],
-            league=player_data[7],
-            card_type=player_data[8]
+            code=definition.code,
+            name=definition.name,
+            position=definition.position,
+            overall_rating=definition.overall,
+            attack_stat=definition.attack,
+            defense_stat=definition.defense,
+            club=definition.club,
+            nation=definition.nation,
+            league=definition.league,
+            card_type=type_map[definition.card_type],
+            event_type=definition.event_type,
         )
         session.add(card)
-    
-    for player_data in event_players:
-        card = Card(
-            name=player_data[0],
-            position=player_data[1],
-            overall_rating=player_data[2],
-            attack_stat=player_data[3],
-            defense_stat=player_data[4],
-            club=player_data[5],
-            nation=player_data[6],
-            league=player_data[7],
-            card_type=player_data[8],
-            event_type=player_data[9]
-        )
-        session.add(card)
+        created += 1
     
     await session.commit()
-    print(f"✅ Created {len(sample_players) + len(event_players)} sample cards")
+    print(f"✅ Created {created} sample cards")
 
 async def populate_from_api(session, count=100):
     """Populate database from API-Football"""
