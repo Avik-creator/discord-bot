@@ -10,65 +10,111 @@ import random
 import asyncio
 import logging
 
+# Create module-level logger
+logger = logging.getLogger('discord_bot')
+
 async def is_admin_check(interaction: discord.Interaction) -> bool:
     """Check if user is admin (either Discord admin, database admin, or bot owner)"""
-    # Check if user is bot owner (highest priority)
-    try:
-        if await interaction.client.is_owner(interaction.user):
-            return True
-    except Exception:
-        pass
+    user_id = interaction.user.id
+    user_name = str(interaction.user)
     
-    # Check Discord server administrator permission
-    # This is the most important check - Discord server admins should have full access
     try:
-        # Ensure we're in a guild context
-        if interaction.guild is not None:
-            # Check if user is the guild owner (guild owners are always admins)
-            if interaction.guild.owner_id == interaction.user.id:
-                return True
+        # Bot owner always has access
+        if hasattr(interaction, 'client') and hasattr(interaction.client, 'is_owner'):
+            try:
+                if await interaction.client.is_owner(interaction.user):
+                    logger.debug(f"User {user_name} ({user_id}) is bot owner - granting admin access")
+                    return True
+            except Exception as e:
+                logger.warning(f"Error checking bot owner status for {user_id}: {e}")
+        
+        # Must be in a guild for Discord admin checks
+        if interaction.guild is None:
+            logger.debug(f"User {user_name} ({user_id}) tried to use admin command outside of guild")
+            # Still check database admin status even outside guild
+        else:
+            guild_id = interaction.guild.id
+            guild_name = interaction.guild.name
             
-            # Get the member object to check permissions
-            # In guild contexts, interaction.user is usually already a Member
+            # Guild owner always has access
+            try:
+                if interaction.guild.owner_id == interaction.user.id:
+                    logger.debug(f"User {user_name} ({user_id}) is guild owner of {guild_name} - granting admin access")
+                    return True
+            except Exception as e:
+                logger.warning(f"Error checking guild owner for {user_id} in {guild_name}: {e}")
+            
+            # Get member object - interaction.user should already be a Member in guild context
             member = None
+            
+            # Method 1: interaction.user is already a Member in guild contexts
             if isinstance(interaction.user, discord.Member):
                 member = interaction.user
-            else:
-                # If it's a User object, try to get the Member
-                member = interaction.guild.get_member(interaction.user.id)
-                if member is None:
-                    # If member not in cache, fetch it
-                    try:
-                        member = await interaction.guild.fetch_member(interaction.user.id)
-                    except:
-                        pass
+                logger.debug(f"Using interaction.user as Member for {user_name} ({user_id})")
             
-            # Check if user has administrator permission
-            if member and hasattr(member, 'guild_permissions'):
-                if member.guild_permissions.administrator:
+            # Method 2: Try cache if not already a Member
+            if member is None:
+                try:
+                    member = interaction.guild.get_member(interaction.user.id)
+                    if member:
+                        logger.debug(f"Found member {user_name} ({user_id}) in cache for {guild_name}")
+                except Exception as e:
+                    logger.debug(f"Could not get member from cache for {user_id} in {guild_name}: {e}")
+            
+            # Method 3: Force fetch if still None (requires members intent)
+            if member is None:
+                try:
+                    member = await interaction.guild.fetch_member(interaction.user.id)
+                    logger.debug(f"Fetched member {user_name} ({user_id}) for {guild_name}")
+                except discord.NotFound:
+                    logger.warning(f"Member {user_id} not found in guild {guild_name}")
+                except discord.Forbidden:
+                    logger.warning(f"Missing permissions to fetch member {user_id} in guild {guild_name}")
+                except Exception as e:
+                    logger.warning(f"Error fetching member {user_id} in guild {guild_name}: {e}")
+            
+            # Check administrator permission
+            if member is not None:
+                try:
+                    # Check if member has administrator permission
+                    if hasattr(member, 'guild_permissions') and member.guild_permissions.administrator:
+                        logger.debug(f"User {user_name} ({user_id}) has administrator permission in {guild_name} - granting admin access")
+                        return True
+                    else:
+                        logger.debug(f"User {user_name} ({user_id}) does not have administrator permission in {guild_name}")
+                        # Log permission value for debugging if available
+                        if hasattr(member, 'guild_permissions'):
+                            logger.debug(f"User {user_id} guild_permissions value: {member.guild_permissions.value}")
+                except AttributeError as e:
+                    logger.warning(f"Member {user_id} does not have guild_permissions attribute: {e}")
+                except Exception as e:
+                    logger.warning(f"Error checking administrator permission for {user_id} in {guild_name}: {e}")
+            else:
+                logger.warning(f"Could not get member object for {user_id} in {guild_name} - cannot check Discord admin status")
+        
+        # Check database admin status
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(User).where(User.id == interaction.user.id)
+                )
+                user = result.scalar_one_or_none()
+                if user and hasattr(user, 'is_admin') and user.is_admin:
+                    logger.debug(f"User {user_name} ({user_id}) has database admin status - granting admin access")
                     return True
+                else:
+                    logger.debug(f"User {user_name} ({user_id}) does not have database admin status")
+        except Exception as e:
+            logger.error(f"Error checking database admin status for {user_id}: {e}", exc_info=True)
+        
+        # All checks failed
+        logger.info(f"User {user_name} ({user_id}) failed all admin checks")
+        return False
+        
     except Exception as e:
-        # Log the error for debugging but don't fail
-        import logging
-        logger = logging.getLogger('discord_bot')
-        logger.debug(f"Error checking Discord admin permissions for user {interaction.user.id}: {e}")
-    
-    # Check database admin status (for non-Discord admins who were granted admin via /admin_manage)
-    try:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(User).where(User.id == interaction.user.id)
-            )
-            user = result.scalar_one_or_none()
-            if user and hasattr(user, 'is_admin') and user.is_admin:
-                return True
-    except Exception as e:
-        # Log the error for debugging
-        import logging
-        logger = logging.getLogger('discord_bot')
-        logger.debug(f"Error checking database admin status for user {interaction.user.id}: {e}")
-    
-    return False
+        # Ultimate catch-all - if ANYTHING goes wrong, deny access (fail secure)
+        logger.error(f"Unexpected error in is_admin_check for {user_id}: {e}", exc_info=True)
+        return False
 
 async def can_manage_admins(interaction: discord.Interaction) -> bool:
     """Check if user can manage admins (bot owner or existing admin)"""
@@ -821,6 +867,8 @@ class AdminCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         
         try:
+            # Copy global commands to this guild's tree first
+            self.bot.tree.copy_global_to(guild=interaction.guild)
             synced = await self.bot.tree.sync(guild=interaction.guild)
             await interaction.followup.send(
                 f"✅ Synced {len(synced)} command(s) to this server!\n"
@@ -828,10 +876,48 @@ class AdminCog(commands.Cog):
                 ephemeral=True
             )
         except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error syncing commands: {e}", exc_info=True)
             await interaction.followup.send(
                 f"❌ Failed to sync commands: {str(e)}",
                 ephemeral=True
             )
+    
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """Handle app command errors for this cog"""
+        if isinstance(error, app_commands.CheckFailure):
+            # Provide helpful error message when admin check fails
+            logger.info(f"Admin check failed for user {interaction.user.id} ({interaction.user}) in command {interaction.command.name if interaction.command else 'unknown'}")
+            
+            # Try to send an error message
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "❌ You don't have permission to use this command!\n\n"
+                        "**To use admin commands, you need one of the following:**\n"
+                        "• Discord Server Administrator permission\n"
+                        "• Guild Owner status\n"
+                        "• Database admin status (granted via `/admin_manage`)\n"
+                        "• Bot Owner status",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        "❌ You don't have permission to use this command!\n\n"
+                        "**To use admin commands, you need one of the following:**\n"
+                        "• Discord Server Administrator permission\n"
+                        "• Guild Owner status\n"
+                        "• Database admin status (granted via `/admin_manage`)\n"
+                        "• Bot Owner status",
+                        ephemeral=True
+                    )
+            except Exception as e:
+                logger.error(f"Error sending CheckFailure message: {e}", exc_info=True)
+            return  # Don't re-raise, we've handled it
+        
+        # For other errors, log and let the global handler deal with it
+        logger.error(f"Unhandled app command error in AdminCog: {error}", exc_info=True)
 
 async def setup(bot):
     await bot.add_cog(AdminCog(bot))

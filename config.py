@@ -110,10 +110,10 @@ FORMATIONS = {
         'positions': {
             'GK': (5, 10),
             'LB': (2, 8), 'LCB': (4, 8), 'RCB': (6, 8), 'RB': (8, 8),
-            'LCM': (3, 5), 'RCM': (7, 5), 'CDM': (5, 6),
+            'LCM': (3, 5), 'CAM': (5, 5), 'RCM': (7, 5),
             'LW': (2, 2), 'ST': (5, 1), 'RW': (8, 2)
         },
-        'bonuses': {'LW': {'attack': 2}, 'ST': {'attack': 2}, 'RW': {'attack': 2}}
+        'bonuses': {'LW': {'attack': 2}, 'ST': {'attack': 2}, 'RW': {'attack': 2}, 'CAM': {'attack': 1}}
     },
     '433_defense': {
         'name': '4-3-3 Defense',
@@ -151,12 +151,13 @@ FORMATIONS = {
         'name': '3-4-3 Diamond',
         'positions': {
             'GK': (5, 10),
-            'LCB': (3, 8), 'RCB': (7, 8), 'CDM': (5, 8),
-            'LCM': (2, 5), 'RCM': (8, 5), 'CAM': (5, 4), 'LB': (3, 6), 'RB': (7, 6),
+            'LCB': (3, 8), 'CB': (5, 8), 'RCB': (7, 8),
+            'LWB': (2, 6), 'LCM': (4, 5), 'RCM': (6, 5), 'RWB': (8, 6),
+            'CAM': (5, 4),
             'LW': (2, 2), 'ST': (5, 1), 'RW': (8, 2)
         },
         'bonuses': {'LCM': {'attack': 2, 'defense': 1}, 'RCM': {'attack': 2, 'defense': 1}, 
-                    'CAM': {'attack': 2}, 'LB': {'defense': 1}, 'RB': {'defense': 1}}
+                    'CAM': {'attack': 2}, 'LWB': {'defense': 1}, 'RWB': {'defense': 1}}
     }
 }
 
@@ -298,7 +299,7 @@ FORMATIONS.update({
         '3-5-2',
         [
             {'positions': ['LCB', 'CB', 'RCB'], 'y': 8},
-            {'positions': ['LWB', 'LDM', 'CAM', 'RDM', 'RWB'], 'y': 7},
+            {'positions': ['LWB', 'LCM', 'CAM', 'RCM', 'RWB'], 'y': 6, 'x_positions': [2, 4, 5, 6, 8]},
             {'positions': ['ST', 'CF'], 'y': 3, 'x_positions': [4, 6]},
         ]
     ),

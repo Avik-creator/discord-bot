@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database.database import AsyncSessionLocal
 from database.models import ServerConfig
+from cogs.admin import is_admin_check
 import config
 
 class ServerConfigCog(commands.Cog):
@@ -13,9 +14,9 @@ class ServerConfigCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
     
-    @app_commands.command(name="configure", description="Set the channel where cards spawn")
+    @app_commands.command(name="configure", description="[ADMIN] Set the channel where cards spawn")
     @app_commands.describe(channel="The channel to spawn cards in")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.check(is_admin_check)
     async def configure_spawn(self, interaction: discord.Interaction, 
                              channel: discord.TextChannel = None):
         """Configure card spawn channel"""
@@ -90,8 +91,8 @@ class ServerConfigCog(commands.Cog):
                 ephemeral=True
             )
     
-    @app_commands.command(name="toggle_spawning", description="Enable or disable card spawning")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.command(name="toggle_spawning", description="[ADMIN] Enable or disable card spawning")
+    @app_commands.check(is_admin_check)
     async def toggle_spawning(self, interaction: discord.Interaction):
         """toggle_spawning"""
         await interaction.response.defer(ephemeral=False)
@@ -148,6 +149,45 @@ class ServerConfigCog(commands.Cog):
                 "❌ An error occurred while toggling spawning.",
                 ephemeral=True
             )
+    
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """Handle app command errors for this cog"""
+        if isinstance(error, app_commands.CheckFailure):
+            # Provide helpful error message when admin check fails
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.info(f"Admin check failed for user {interaction.user.id} ({interaction.user}) in command {interaction.command.name if interaction.command else 'unknown'}")
+            
+            # Try to send an error message
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "❌ You don't have permission to use this command!\n\n"
+                        "**To use server configuration commands, you need one of the following:**\n"
+                        "• Discord Server Administrator permission\n"
+                        "• Guild Owner status\n"
+                        "• Database admin status (granted via `/admin_manage`)\n"
+                        "• Bot Owner status",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        "❌ You don't have permission to use this command!\n\n"
+                        "**To use server configuration commands, you need one of the following:**\n"
+                        "• Discord Server Administrator permission\n"
+                        "• Guild Owner status\n"
+                        "• Database admin status (granted via `/admin_manage`)\n"
+                        "• Bot Owner status",
+                        ephemeral=True
+                    )
+            except Exception as e:
+                logger.error(f"Error sending CheckFailure message: {e}", exc_info=True)
+            return  # Don't re-raise, we've handled it
+        
+        # For other errors, log and let the global handler deal with it
+        import logging
+        logger = logging.getLogger('discord_bot')
+        logger.error(f"Unhandled app command error in ServerConfigCog: {error}", exc_info=True)
 
 async def setup(bot):
     await bot.add_cog(ServerConfigCog(bot))

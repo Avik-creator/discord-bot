@@ -60,29 +60,70 @@ class FootballCardBot(commands.Bot):
                 await self.load_extension(cog)
                 logger.info(f"Loaded {cog}")
             except Exception as e:
-                logger.error(f"Failed to load {cog}: {e}")
+                logger.error(f"Failed to load {cog}: {e}", exc_info=True)
         
-        # Sync commands
-        logger.info("Syncing commands...")
+        # Count registered commands before syncing
+        command_count = len(self.tree.get_commands())
+        logger.info(f"Registered {command_count} command(s) in command tree")
+        
+        if command_count == 0:
+            logger.error("⚠️  No commands found in command tree! Check if cogs are loading correctly.")
+        else:
+            # List all registered commands for debugging
+            command_names = [cmd.name for cmd in self.tree.get_commands()]
+            logger.info(f"Registered commands: {', '.join(command_names[:10])}{'...' if len(command_names) > 10 else ''}")
+        
+        # Sync commands globally first
+        logger.info("Syncing commands globally...")
         try:
             synced = await self.tree.sync()
-            logger.info(f"Synced {len(synced)} command(s)")
+            logger.info(f"Synced {len(synced)} command(s) globally")
+            if len(synced) == 0 and command_count > 0:
+                logger.warning("⚠️  Commands are registered but sync returned 0. They may already be synced or there's a sync issue.")
+            elif len(synced) == 0:
+                logger.error("⚠️  No commands were synced! This might indicate a problem with command registration.")
         except Exception as e:
-            logger.error(f"Failed to sync commands: {e}")
+            logger.error(f"Failed to sync commands globally: {e}", exc_info=True)
     
     async def on_ready(self):
         """Called when bot is ready"""
         logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
         logger.info(f'Connected to {len(self.guilds)} guild(s)')
         
+        # Count registered commands
+        command_count = len(self.tree.get_commands())
+        logger.info(f"Command tree has {command_count} registered command(s)")
+        
         # Sync commands to all guilds for faster propagation
+        # Copy global commands to each guild's tree, then sync
         logger.info("Syncing commands to all guilds...")
+        total_synced = 0
         for guild in self.guilds:
             try:
+                # Copy global commands to this guild's tree
+                self.tree.copy_global_to(guild=guild)
+                # Add a small delay to avoid rate limits
+                await asyncio.sleep(0.5)
                 synced = await self.tree.sync(guild=guild)
-                logger.info(f"Synced {len(synced)} command(s) to {guild.name}")
+                synced_count = len(synced)
+                total_synced += synced_count
+                if synced_count > 0:
+                    logger.info(f"Synced {synced_count} command(s) to {guild.name}")
+                else:
+                    # 0 commands returned usually means they're already synced
+                    logger.info(f"Commands already synced to {guild.name} (or no changes needed)")
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    logger.warning(f"Rate limited while syncing to {guild.name}. Commands will sync automatically.")
+                else:
+                    logger.error(f"Failed to sync commands to {guild.name}: {e}", exc_info=True)
             except Exception as e:
-                logger.error(f"Failed to sync commands to {guild.name}: {e}")
+                logger.error(f"Failed to sync commands to {guild.name}: {e}", exc_info=True)
+        
+        # Note: total_synced == 0 is often normal if commands are already synced
+        if total_synced == 0 and len(self.guilds) > 0 and command_count > 0:
+            logger.info("Commands are already synced to all guilds (or syncing in background)")
+            logger.info("💡 If commands don't appear, wait a few minutes or use /sync_commands")
         
         # Set bot status
         await self.change_presence(
@@ -122,12 +163,21 @@ class FootballCardBot(commands.Bot):
         """Called when bot joins a new guild"""
         logger.info(f"Joined new guild: {guild.name} (ID: {guild.id})")
         
+        # Wait a moment to ensure bot is ready
+        await asyncio.sleep(1)
+        
         # Sync commands to this guild immediately
         try:
+            # Copy global commands to this guild's tree first
+            self.tree.copy_global_to(guild=guild)
+            all_commands = self.tree.get_commands(guild=guild)
+            logger.info(f"Syncing {len(all_commands)} command(s) to {guild.name}...")
             synced = await self.tree.sync(guild=guild)
             logger.info(f"Synced {len(synced)} command(s) to {guild.name}")
+            if len(synced) == 0:
+                logger.warning(f"⚠️  No commands synced to {guild.name}. This may indicate a registration issue.")
         except Exception as e:
-            logger.error(f"Failed to sync commands to {guild.name}: {e}")
+            logger.error(f"Failed to sync commands to {guild.name}: {e}", exc_info=True)
         
         # Create server config
         async with AsyncSessionLocal() as session:
