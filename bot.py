@@ -18,10 +18,18 @@ logger = logging.getLogger('discord_bot')
 
 # Bot setup
 intents = discord.Intents.default()
-intents.message_content = True
 intents.messages = True
 intents.guilds = True
-intents.members = True
+
+# Privileged intents - required for card spawning and member features
+# Enable these in Discord Developer Portal: https://discord.com/developers/applications
+try:
+    intents.message_content = True  # Required for on_message (card spawning)
+    intents.members = True  # Required for member-related features
+except Exception:
+    logger.warning("⚠️  Privileged intents not enabled! Some features may not work.")
+    logger.warning("⚠️  Enable 'Message Content Intent' and 'Server Members Intent' in Discord Developer Portal")
+    logger.warning("⚠️  Card spawning will be disabled without Message Content Intent")
 
 class FootballCardBot(commands.Bot):
     def __init__(self):
@@ -67,6 +75,15 @@ class FootballCardBot(commands.Bot):
         logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
         logger.info(f'Connected to {len(self.guilds)} guild(s)')
         
+        # Sync commands to all guilds for faster propagation
+        logger.info("Syncing commands to all guilds...")
+        for guild in self.guilds:
+            try:
+                synced = await self.tree.sync(guild=guild)
+                logger.info(f"Synced {len(synced)} command(s) to {guild.name}")
+            except Exception as e:
+                logger.error(f"Failed to sync commands to {guild.name}: {e}")
+        
         # Set bot status
         await self.change_presence(
             activity=discord.Game(name="⚽ /help | Football Cards")
@@ -104,6 +121,13 @@ class FootballCardBot(commands.Bot):
     async def on_guild_join(self, guild: discord.Guild):
         """Called when bot joins a new guild"""
         logger.info(f"Joined new guild: {guild.name} (ID: {guild.id})")
+        
+        # Sync commands to this guild immediately
+        try:
+            synced = await self.tree.sync(guild=guild)
+            logger.info(f"Synced {len(synced)} command(s) to {guild.name}")
+        except Exception as e:
+            logger.error(f"Failed to sync commands to {guild.name}: {e}")
         
         # Create server config
         async with AsyncSessionLocal() as session:
@@ -153,23 +177,45 @@ class FootballCardBot(commands.Bot):
     
     async def on_app_command_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
         """Handle application command errors"""
-        if isinstance(error, discord.app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                "❌ You don't have permission to use this command!",
-                ephemeral=True
-            )
-        elif isinstance(error, discord.app_commands.CommandOnCooldown):
-            await interaction.response.send_message(
-                f"⏰ This command is on cooldown. Try again in {error.retry_after:.1f}s",
-                ephemeral=True
-            )
-        else:
-            logger.error(f"Application command error: {error}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ An error occurred while processing this command.",
-                    ephemeral=True
-                )
+        logger.error(f"Application command error: {error}", exc_info=True)
+        
+        try:
+            if isinstance(error, discord.app_commands.MissingPermissions):
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "❌ You don't have permission to use this command!",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        "❌ You don't have permission to use this command!",
+                        ephemeral=True
+                    )
+            elif isinstance(error, discord.app_commands.CommandOnCooldown):
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        f"⏰ This command is on cooldown. Try again in {error.retry_after:.1f}s",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"⏰ This command is on cooldown. Try again in {error.retry_after:.1f}s",
+                        ephemeral=True
+                    )
+            else:
+                error_msg = f"❌ An error occurred: {str(error)}"
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        error_msg,
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        error_msg,
+                        ephemeral=True
+                    )
+        except Exception as e:
+            logger.error(f"Error sending error message: {e}")
 
 def run_api_server():
     """Run the FastAPI server in a separate thread"""

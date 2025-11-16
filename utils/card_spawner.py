@@ -98,7 +98,7 @@ class CardSpawner:
             message = await channel.send(embed=embed, view=view)
             
             # Store spawned card in database
-            expires_at = datetime.utcnow() + timedelta(seconds=config.CATCH_TIMEOUT_SECONDS)
+            expires_at = discord.utils.utcnow() + timedelta(seconds=config.CATCH_TIMEOUT_SECONDS)
             spawned_card = SpawnedCard(
                 guild_id=guild_id,
                 channel_id=channel_id,

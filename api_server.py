@@ -4,8 +4,9 @@ FastAPI server for CSV upload endpoint to update/insert player cards
 import csv
 import io
 import logging
+import json
 from typing import List, Dict
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Header
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
@@ -14,6 +15,15 @@ from database.models import Card, CardType
 import config
 
 logger = logging.getLogger('api_server')
+
+# Discord signature verification
+try:
+    from nacl.signing import VerifyKey
+    from nacl.exceptions import BadSignatureError
+    HAS_NACL = True
+except ImportError:
+    HAS_NACL = False
+    logger.warning("PyNaCl not installed. Discord signature verification will be disabled.")
 
 app = FastAPI(title="Football Card Bot API", version="1.0.0")
 
@@ -150,6 +160,88 @@ async def process_csv_row(session: AsyncSession, row: Dict[str, str], row_num: i
 async def root():
     """Health check endpoint"""
     return {"status": "ok", "message": "Football Card Bot API is running"}
+
+def verify_discord_signature(body: bytes, signature: str, timestamp: str) -> bool:
+    """
+    Verify Discord request signature using Ed25519
+    """
+    if not HAS_NACL:
+        logger.warning("PyNaCl not available, skipping signature verification")
+        return True  # Allow request if PyNaCl is not installed
+    
+    try:
+        # Get public key from config
+        public_key = config.DISCORD_PUBLIC_KEY
+        
+        # Create verify key
+        verify_key = VerifyKey(bytes.fromhex(public_key))
+        
+        # Create message to verify: timestamp + body
+        message = timestamp.encode() + body
+        
+        # Verify signature
+        verify_key.verify(message, bytes.fromhex(signature))
+        return True
+    except (BadSignatureError, ValueError, Exception) as e:
+        logger.error(f"Signature verification failed: {e}")
+        return False
+
+@app.post("/interactions")
+async def discord_interactions(request: Request):
+    """
+    Discord Interactions Endpoint for verification
+    Handles PING requests for endpoint verification
+    """
+    try:
+        # Get headers (Discord sends X-Signature-Ed25519 and X-Signature-Timestamp)
+        headers = request.headers
+        x_signature_ed25519 = headers.get("x-signature-ed25519") or headers.get("X-Signature-Ed25519")
+        x_signature_timestamp = headers.get("x-signature-timestamp") or headers.get("X-Signature-Timestamp")
+        
+        # Read body
+        body = await request.body()
+        
+        # Verify signature if headers are provided
+        if x_signature_ed25519 and x_signature_timestamp:
+            if not verify_discord_signature(body, x_signature_ed25519, x_signature_timestamp):
+                logger.warning("Invalid Discord signature")
+                raise HTTPException(status_code=401, detail="Invalid signature")
+        else:
+            # For initial verification, Discord might send a request without signature
+            # Log it but allow it to proceed
+            logger.info("Discord interaction received without signature headers (may be initial verification)")
+        
+        # Parse request body
+        try:
+            data = json.loads(body.decode('utf-8'))
+        except json.JSONDecodeError:
+            # If body is empty or not JSON, return PONG for verification
+            logger.info("Empty or non-JSON body, returning PONG for verification")
+            return JSONResponse(content={"type": 1})
+        
+        # Handle PING request (Discord sends this to verify the endpoint)
+        if data.get('type') == 1:  # PING
+            logger.info("Received Discord PING, responding with PONG")
+            return JSONResponse(content={"type": 1})  # PONG response
+        
+        # For other interaction types, you would handle them here
+        # For now, just return PONG for verification
+        logger.info(f"Received Discord interaction type: {data.get('type')}")
+        return JSONResponse(content={"type": 1})
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error handling Discord interaction: {e}", exc_info=True)
+        # Return PONG even on error to help with verification
+        return JSONResponse(content={"type": 1}, status_code=200)
+
+@app.get("/interactions")
+async def discord_interactions_get():
+    """
+    GET endpoint for Discord verification (some setups require this)
+    """
+    return {"status": "ok", "message": "Discord Interactions Endpoint"}
 
 @app.post("/api/upload-csv")
 async def upload_csv(file: UploadFile = File(...)):

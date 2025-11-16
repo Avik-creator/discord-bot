@@ -5,15 +5,51 @@ load_dotenv()
 
 # Discord Configuration
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+DISCORD_PUBLIC_KEY = os.getenv('DISCORD_PUBLIC_KEY', '571d40a69ef3e59ae7c8db5b4b3e8c9c09d10aa4933b2428cee14ff16e9db38d')
 
 # Database Configuration
-POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'localhost')
-POSTGRES_PORT = os.getenv('POSTGRES_PORT', '5432')
-POSTGRES_DB = os.getenv('POSTGRES_DB', 'discord_bot')
-POSTGRES_USER = os.getenv('POSTGRES_USER', 'postgres')
-POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD')
+# Option 1: Use full DATABASE_URL (recommended for cloud databases like Neon)
+# Option 2: Use individual components (for local databases)
+DATABASE_URL = os.getenv('DATABASE_URL')
 
-DATABASE_URL = f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+if not DATABASE_URL:
+    # Build from individual components if DATABASE_URL not provided
+    POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'localhost')
+    POSTGRES_PORT = os.getenv('POSTGRES_PORT', '5432')
+    POSTGRES_DB = os.getenv('POSTGRES_DB', 'discord_bot')
+    POSTGRES_USER = os.getenv('POSTGRES_USER', 'postgres')
+    POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD')
+    
+    DATABASE_URL = f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+else:
+    # Convert postgresql:// to postgresql+asyncpg:// for SQLAlchemy async
+    if DATABASE_URL.startswith('postgresql://'):
+        DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://', 1)
+    elif not DATABASE_URL.startswith('postgresql+asyncpg://'):
+        # If it's already postgresql+asyncpg://, keep it as is
+        pass
+    
+    # Remove sslmode/channel_binding query params - asyncpg handles SSL differently
+    # For asyncpg, SSL is enabled by default for cloud databases
+    # We'll configure SSL in the engine creation if needed
+    if '?sslmode=' in DATABASE_URL or '&sslmode=' in DATABASE_URL:
+        # Remove sslmode and channel_binding parameters
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        parsed = urlparse(DATABASE_URL)
+        query_params = parse_qs(parsed.query)
+        # Remove sslmode and channel_binding
+        query_params.pop('sslmode', None)
+        query_params.pop('channel_binding', None)
+        # Rebuild URL without those params
+        new_query = urlencode(query_params, doseq=True)
+        DATABASE_URL = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            parsed.fragment
+        ))
 
 # API Configuration
 API_FOOTBALL_KEY = os.getenv('API_FOOTBALL_KEY')

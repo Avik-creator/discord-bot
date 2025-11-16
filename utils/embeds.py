@@ -1,7 +1,6 @@
 import discord
 from typing import List, Dict, Optional
 from database.models import Card, User, Team, Match
-from datetime import datetime
 
 class EmbedBuilder:
     """Creates formatted Discord embeds for the bot"""

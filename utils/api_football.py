@@ -11,10 +11,10 @@ class APIFootball:
     
     def __init__(self):
         self.base_url = config.API_FOOTBALL_BASE_URL
-        self.api_key = config.API_FOOTBALL_KEY
+        self.api_key = config.API_FOOTBALL_KEY  # Optional - not needed for CSV uploads
         self.headers = {
             'x-apisports-key': self.api_key
-        }
+        } if self.api_key else {}
     
     async def _make_request(self, endpoint: str, params: Dict = None) -> Optional[Dict]:
         """Make an API request"""

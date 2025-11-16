@@ -26,7 +26,13 @@ class CollectionCog(commands.Cog):
             return True, 0
         
         cooldown_duration = config.COOLDOWNS.get(cooldown_type, 0)
-        time_passed = (datetime.utcnow() - last_use).total_seconds()
+        # Use discord.utils.utcnow() for timezone-aware datetime
+        now = discord.utils.utcnow()
+        # Ensure last_use is timezone-aware (if it's naive, make it aware)
+        if last_use.tzinfo is None:
+            from datetime import timezone
+            last_use = last_use.replace(tzinfo=timezone.utc)
+        time_passed = (now - last_use).total_seconds()
         
         if time_passed >= cooldown_duration:
             return True, 0
@@ -35,7 +41,7 @@ class CollectionCog(commands.Cog):
     
     async def _give_random_card(self, session: AsyncSession, user_id: int, 
                                card_type: CardType = None) -> Card:
-        """Give a random card to user"""
+        """Give a random card to user (does NOT commit - caller must commit)"""
         # Get random card
         card = await self.api_football.get_random_card_from_db(session, card_type)
         
@@ -57,7 +63,7 @@ class CollectionCog(commands.Cog):
         if user:
             user.cards_collected += 1
         
-        await session.commit()
+        # DO NOT commit here - let the caller commit after interaction succeeds
         return card
     
     @app_commands.command(name="pack", description="Open a pack")
@@ -71,62 +77,92 @@ class CollectionCog(commands.Cog):
     ])
     async def open_pack(self, interaction: discord.Interaction, pack_type: str):
         """Open different types of packs"""
-        async with AsyncSessionLocal() as session:
-            # Get or create user
-            result = await session.execute(
-                select(User).where(User.id == interaction.user.id)
+        # Defer immediately to avoid timeout
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get or create user
+                result = await session.execute(
+                    select(User).where(User.id == interaction.user.id)
+                )
+                user = result.scalar_one_or_none()
+                
+                if not user:
+                    user = User(id=interaction.user.id, username=interaction.user.name)
+                    session.add(user)
+                    await session.flush()
+                
+                # Check cooldown
+                can_use, seconds_remaining = await self._check_cooldown(user, pack_type)
+                
+                if not can_use:
+                    hours = seconds_remaining // 3600
+                    minutes = (seconds_remaining % 3600) // 60
+                    await interaction.followup.send(
+                        f"⏰ This pack is on cooldown! Try again in {hours}h {minutes}m",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Determine card type based on pack
+                card_type_map = {
+                    'daily_pack': CardType.BASE,
+                    'weekly_pack': CardType.ICON,
+                    'event_pack': CardType.EVENT,
+                    'premium_pack': None,  # Random
+                    'booster_pack': CardType.BASE,
+                }
+                
+                card_type = card_type_map.get(pack_type)
+                
+                # Give random card
+                card = await self._give_random_card(session, interaction.user.id, card_type)
+                
+                if not card:
+                    await interaction.followup.send(
+                        "❌ Error opening pack. Please try again later.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Update cooldown
+                cooldown_field = f"{pack_type}_cooldown"
+                setattr(user, cooldown_field, discord.utils.utcnow())
+                
+                # Show card FIRST before committing
+                embed = EmbedBuilder.card_embed(card, show_full=True)
+                embed.title = f"📦 Pack Opened - {card.name}!"
+                embed.color = discord.Color.gold()
+                
+                # Send interaction response - if this fails, we won't commit
+                try:
+                    await interaction.followup.send(embed=embed)
+                    # Only commit if interaction response succeeds
+                    await session.commit()
+                except Exception as send_error:
+                    # Rollback if interaction fails
+                    await session.rollback()
+                    import logging
+                    logger = logging.getLogger('discord_bot')
+                    logger.error(f"Failed to send pack response, rolled back transaction: {send_error}")
+                    # Try to send error message (might also fail, but worth trying)
+                    try:
+                        await interaction.followup.send(
+                            "❌ Pack opened but failed to display. Please check your collection.",
+                            ephemeral=True
+                        )
+                    except:
+                        pass
+                    raise
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in open_pack: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while opening the pack. Please try again.",
+                ephemeral=True
             )
-            user = result.scalar_one_or_none()
-            
-            if not user:
-                user = User(id=interaction.user.id, username=interaction.user.name)
-                session.add(user)
-                await session.flush()
-            
-            # Check cooldown
-            can_use, seconds_remaining = await self._check_cooldown(user, pack_type)
-            
-            if not can_use:
-                hours = seconds_remaining // 3600
-                minutes = (seconds_remaining % 3600) // 60
-                await interaction.response.send_message(
-                    f"⏰ This pack is on cooldown! Try again in {hours}h {minutes}m",
-                    ephemeral=True
-                )
-                return
-            
-            # Determine card type based on pack
-            card_type_map = {
-                'daily_pack': CardType.BASE,
-                'weekly_pack': CardType.ICON,
-                'event_pack': CardType.EVENT,
-                'premium_pack': None,  # Random
-                'booster_pack': CardType.BASE,
-            }
-            
-            card_type = card_type_map.get(pack_type)
-            
-            # Give random card
-            card = await self._give_random_card(session, interaction.user.id, card_type)
-            
-            if not card:
-                await interaction.response.send_message(
-                    "❌ Error opening pack. Please try again later.",
-                    ephemeral=True
-                )
-                return
-            
-            # Update cooldown
-            cooldown_field = f"{pack_type}_cooldown"
-            setattr(user, cooldown_field, datetime.utcnow())
-            await session.commit()
-            
-            # Show card
-            embed = EmbedBuilder.card_embed(card, show_full=True)
-            embed.title = f"📦 Pack Opened - {card.name}!"
-            embed.color = discord.Color.gold()
-            
-            await interaction.response.send_message(embed=embed)
     
     @app_commands.command(name="collection", description="View your card collection")
     @app_commands.describe(
@@ -142,15 +178,18 @@ class CollectionCog(commands.Cog):
     async def view_collection(self, interaction: discord.Interaction, 
                              sort_by: str = "ovr", event_filter: str = None, page: int = 1):
         """View user's card collection"""
-        async with AsyncSessionLocal() as session:
-            # Get user
-            result = await session.execute(
-                select(User).where(User.id == interaction.user.id)
-            )
-            user = result.scalar_one_or_none()
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get user
+                result = await session.execute(
+                    select(User).where(User.id == interaction.user.id)
+                )
+                user = result.scalar_one_or_none()
             
             if not user:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "You don't have any cards yet! Use `/pack` or catch spawned cards.",
                     ephemeral=True
                 )
@@ -179,7 +218,7 @@ class CollectionCog(commands.Cog):
             card_data = result.all()
             
             if not card_data:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "No cards found with those filters!",
                     ephemeral=True
                 )
@@ -198,24 +237,35 @@ class CollectionCog(commands.Cog):
             
             embed = EmbedBuilder.collection_embed(user, page_cards, page, total_pages, sort_by)
             
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in view_collection: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while loading your collection.",
+                ephemeral=True
+            )
     
     @app_commands.command(name="show", description="Display a specific card in detail")
     @app_commands.describe(player_name="Name of the player to show")
     async def show_card(self, interaction: discord.Interaction, player_name: str):
         """Show detailed card information"""
-        async with AsyncSessionLocal() as session:
-            # Find card in user's collection
-            result = await session.execute(
-                select(Card, Collection)
-                .join(Collection, Card.id == Collection.card_id)
-                .where(Collection.user_id == interaction.user.id)
-                .where(Card.name.ilike(f"%{player_name}%"))
-            )
-            card_data = result.first()
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                # Find card in user's collection
+                result = await session.execute(
+                    select(Card, Collection)
+                    .join(Collection, Card.id == Collection.card_id)
+                    .where(Collection.user_id == interaction.user.id)
+                    .where(Card.name.ilike(f"%{player_name}%"))
+                )
+                card_data = result.first()
             
             if not card_data:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"You don't have a card matching '{player_name}'!",
                     ephemeral=True
                 )
@@ -224,176 +274,252 @@ class CollectionCog(commands.Cog):
             card, _ = card_data
             
             embed = EmbedBuilder.card_embed(card, show_full=True)
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in show_card: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while loading the card.",
+                ephemeral=True
+            )
     
     @app_commands.command(name="stats", description="View your statistics")
     async def view_stats(self, interaction: discord.Interaction):
         """Show user statistics"""
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(User).where(User.id == interaction.user.id)
-            )
-            user = result.scalar_one_or_none()
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(User).where(User.id == interaction.user.id)
+                )
+                user = result.scalar_one_or_none()
             
             if not user:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "You don't have any stats yet! Start playing to build your profile.",
                     ephemeral=True
                 )
                 return
             
             embed = EmbedBuilder.stats_embed(user)
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in view_stats: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while loading your stats.",
+                ephemeral=True
+            )
     
     @app_commands.command(name="vote", description="Vote for the bot to get a reward")
     async def vote_reward(self, interaction: discord.Interaction):
         """Give reward for voting"""
-        async with AsyncSessionLocal() as session:
-            # Get or create user
-            result = await session.execute(
-                select(User).where(User.id == interaction.user.id)
-            )
-            user = result.scalar_one_or_none()
-            
-            if not user:
-                user = User(id=interaction.user.id, username=interaction.user.name)
-                session.add(user)
-                await session.flush()
-            
-            # Check cooldown
-            can_use, seconds_remaining = await self._check_cooldown(user, 'vote')
-            
-            if not can_use:
-                hours = seconds_remaining // 3600
-                minutes = (seconds_remaining % 3600) // 60
-                await interaction.response.send_message(
-                    f"⏰ You can vote again in {hours}h {minutes}m",
-                    ephemeral=True
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get or create user
+                result = await session.execute(
+                    select(User).where(User.id == interaction.user.id)
                 )
-                return
-            
-            # Give random base card
-            card = await self._give_random_card(session, interaction.user.id, CardType.BASE)
-            
-            if not card:
-                await interaction.response.send_message(
-                    "❌ Error giving reward. Please try again later.",
-                    ephemeral=True
+                user = result.scalar_one_or_none()
+                
+                if not user:
+                    user = User(id=interaction.user.id, username=interaction.user.name)
+                    session.add(user)
+                    await session.flush()
+                
+                # Check cooldown
+                can_use, seconds_remaining = await self._check_cooldown(user, 'vote')
+                
+                if not can_use:
+                    hours = seconds_remaining // 3600
+                    minutes = (seconds_remaining % 3600) // 60
+                    await interaction.followup.send(
+                        f"⏰ You can vote again in {hours}h {minutes}m",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Give random base card
+                card = await self._give_random_card(session, interaction.user.id, CardType.BASE)
+                
+                if not card:
+                    await interaction.followup.send(
+                        "❌ Error giving reward. Please try again later.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Update cooldown
+                user.vote_cooldown = discord.utils.utcnow()
+                
+                embed = discord.Embed(
+                    title="🗳️ Thanks for Voting!",
+                    description=f"You received **{card.name}** ({card.overall_rating} OVR)!",
+                    color=discord.Color.gold()
                 )
-                return
-            
-            # Update cooldown
-            user.vote_cooldown = datetime.utcnow()
-            await session.commit()
-            
-            embed = discord.Embed(
-                title="🗳️ Thanks for Voting!",
-                description=f"You received **{card.name}** ({card.overall_rating} OVR)!",
-                color=discord.Color.gold()
+                embed.add_field(name="Vote Link", value="[Vote on top.gg](https://top.gg)", inline=False)
+                
+                # Send interaction response - if this fails, we won't commit
+                try:
+                    await interaction.followup.send(embed=embed)
+                    # Only commit if interaction response succeeds
+                    await session.commit()
+                except Exception as send_error:
+                    # Rollback if interaction fails
+                    await session.rollback()
+                    import logging
+                    logger = logging.getLogger('discord_bot')
+                    logger.error(f"Failed to send vote reward response, rolled back transaction: {send_error}")
+                    # Try to send error message (might also fail, but worth trying)
+                    try:
+                        await interaction.followup.send(
+                            "❌ Reward processed but failed to display. Please check your collection.",
+                            ephemeral=True
+                        )
+                    except:
+                        pass
+                    raise
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in vote_reward: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while processing your vote.",
+                ephemeral=True
             )
-            embed.add_field(name="Vote Link", value="[Vote on top.gg](https://top.gg)", inline=False)
-            
-            await interaction.response.send_message(embed=embed)
     
     @app_commands.command(name="promo", description="Redeem a promo code")
     @app_commands.describe(code="The promo code to redeem")
     async def redeem_promo(self, interaction: discord.Interaction, code: str):
         """Redeem a promo code"""
-        async with AsyncSessionLocal() as session:
-            # Get or create user
-            result = await session.execute(
-                select(User).where(User.id == interaction.user.id)
-            )
-            user = result.scalar_one_or_none()
-            
-            if not user:
-                user = User(id=interaction.user.id, username=interaction.user.name)
-                session.add(user)
-                await session.flush()
-            
-            # Find promo code
-            result = await session.execute(
-                select(PromoCode).where(PromoCode.code == code.upper())
-            )
-            promo = result.scalar_one_or_none()
-            
-            if not promo or not promo.active:
-                await interaction.response.send_message(
-                    "❌ Invalid or expired promo code!",
-                    ephemeral=True
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get or create user
+                result = await session.execute(
+                    select(User).where(User.id == interaction.user.id)
                 )
-                return
-            
-            # Check if user already used this code
-            if interaction.user.id in promo.used_by:
-                await interaction.response.send_message(
-                    "❌ You have already used this promo code!",
-                    ephemeral=True
+                user = result.scalar_one_or_none()
+                
+                if not user:
+                    user = User(id=interaction.user.id, username=interaction.user.name)
+                    session.add(user)
+                    await session.flush()
+                
+                # Find promo code
+                result = await session.execute(
+                    select(PromoCode).where(PromoCode.code == code.upper())
                 )
-                return
-            
-            # Check max uses
-            if promo.max_uses and promo.current_uses >= promo.max_uses:
-                await interaction.response.send_message(
-                    "❌ This promo code has reached its usage limit!",
-                    ephemeral=True
-                )
-                return
-            
-            # Check expiration
-            if promo.expires_at and datetime.utcnow() > promo.expires_at:
-                await interaction.response.send_message(
-                    "❌ This promo code has expired!",
-                    ephemeral=True
-                )
-                return
-            
-            # Give reward based on type
-            reward = promo.reward
-            reward_text = ""
-            
-            if reward['type'] == 'card':
-                # Give specific card
-                card_id = reward.get('card_id')
-                if card_id:
-                    collection_entry = Collection(
-                        user_id=interaction.user.id,
-                        card_id=card_id
+                promo = result.scalar_one_or_none()
+                
+                if not promo or not promo.active:
+                    await interaction.followup.send(
+                        "❌ Invalid or expired promo code!",
+                        ephemeral=True
                     )
-                    session.add(collection_entry)
-                    user.cards_collected += 1
-                    reward_text = "You received a special card!"
-            
-            elif reward['type'] == 'pack':
-                # Give pack type
-                pack_type = reward.get('pack_type', 'base')
-                card_type_map = {
-                    'base': CardType.BASE,
-                    'icon': CardType.ICON,
-                    'event': CardType.EVENT
-                }
-                card = await self._give_random_card(
-                    session, interaction.user.id, 
-                    card_type_map.get(pack_type, CardType.BASE)
+                    return
+                
+                # Check if user already used this code
+                if interaction.user.id in promo.used_by:
+                    await interaction.followup.send(
+                        "❌ You have already used this promo code!",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Check max uses
+                if promo.max_uses and promo.current_uses >= promo.max_uses:
+                    await interaction.followup.send(
+                        "❌ This promo code has reached its usage limit!",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Check expiration
+                if promo.expires_at and discord.utils.utcnow() > promo.expires_at:
+                    await interaction.followup.send(
+                        "❌ This promo code has expired!",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Give reward based on type
+                reward = promo.reward
+                reward_text = ""
+                
+                if reward['type'] == 'card':
+                    # Give specific card
+                    card_id = reward.get('card_id')
+                    if card_id:
+                        collection_entry = Collection(
+                            user_id=interaction.user.id,
+                            card_id=card_id
+                        )
+                        session.add(collection_entry)
+                        user.cards_collected += 1
+                        reward_text = "You received a special card!"
+                
+                elif reward['type'] == 'pack':
+                    # Give pack type
+                    pack_type = reward.get('pack_type', 'base')
+                    card_type_map = {
+                        'base': CardType.BASE,
+                        'icon': CardType.ICON,
+                        'event': CardType.EVENT
+                    }
+                    card = await self._give_random_card(
+                        session, interaction.user.id, 
+                        card_type_map.get(pack_type, CardType.BASE)
+                    )
+                    if card:
+                        reward_text = f"You received **{card.name}** ({card.overall_rating} OVR)!"
+                
+                # Update promo code usage
+                promo.current_uses += 1
+                if promo.used_by is None:
+                    promo.used_by = []
+                promo.used_by.append(interaction.user.id)
+                
+                embed = discord.Embed(
+                    title="🎁 Promo Code Redeemed!",
+                    description=reward_text,
+                    color=discord.Color.gold()
                 )
-                if card:
-                    reward_text = f"You received **{card.name}** ({card.overall_rating} OVR)!"
-            
-            # Update promo code usage
-            promo.current_uses += 1
-            if promo.used_by is None:
-                promo.used_by = []
-            promo.used_by.append(interaction.user.id)
-            
-            await session.commit()
-            
-            embed = discord.Embed(
-                title="🎁 Promo Code Redeemed!",
-                description=reward_text,
-                color=discord.Color.gold()
+                
+                # Send interaction response - if this fails, we won't commit
+                try:
+                    await interaction.followup.send(embed=embed)
+                    # Only commit if interaction response succeeds
+                    await session.commit()
+                except Exception as send_error:
+                    # Rollback if interaction fails
+                    await session.rollback()
+                    import logging
+                    logger = logging.getLogger('discord_bot')
+                    logger.error(f"Failed to send promo code response, rolled back transaction: {send_error}")
+                    # Try to send error message (might also fail, but worth trying)
+                    try:
+                        await interaction.followup.send(
+                            "❌ Promo code processed but failed to display. Please check your collection.",
+                            ephemeral=True
+                        )
+                    except:
+                        pass
+                    raise
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in redeem_promo: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while redeeming the promo code.",
+                ephemeral=True
             )
-            
-            await interaction.response.send_message(embed=embed)
     
     @app_commands.command(name="buy", description="Get a link to the Patreon store")
     async def buy_link(self, interaction: discord.Interaction):

@@ -44,7 +44,7 @@ A comprehensive Discord bot for collecting, trading, and battling with football 
 - Python 3.10 or higher
 - PostgreSQL 13 or higher
 - Discord Bot Token
-- API-Football API Key (from https://www.api-football.com/)
+- **API-Football API Key is optional** - You can use CSV uploads instead (see `SETUP_GUIDE.md`)
 
 ### Step 1: Clone and Setup
 
@@ -116,29 +116,28 @@ CATCH_TIMEOUT_SECONDS=180
 
 ### Step 5: Populate Database with Players
 
-Before running the bot, you should populate the database with player data:
+**Option 1: Using CSV Upload (Recommended - No API Key Needed)**
 
-```python
-# Create a script populate_db.py
-import asyncio
-from database.database import AsyncSessionLocal, init_db
-from utils.api_football import APIFootball
+1. Create a CSV file with your cards (see `SETUP_GUIDE.md` for format)
+2. Start the bot: `python bot.py` (API server starts automatically)
+3. Upload CSV via API:
+   ```bash
+   curl -X POST "http://localhost:8000/api/upload-csv" -F "file=@your_cards.csv"
+   ```
 
-async def populate():
-    await init_db()
-    api = APIFootball()
-    async with AsyncSessionLocal() as session:
-        count = await api.populate_database(session, count=200)
-        print(f"Populated database with {count} players")
+**Option 2: Using Card Catalog**
 
-if __name__ == "__main__":
-    asyncio.run(populate())
+Run the populate script and choose option 2:
+```bash
+python populate_db.py
+# Select option 2: "Use sample data"
 ```
 
-Run it:
+**Option 3: Using API-Football (Requires API Key)**
 
 ```bash
 python populate_db.py
+# Select option 1: "Use API-Football"
 ```
 
 ### Step 6: Run the Bot

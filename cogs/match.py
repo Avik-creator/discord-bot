@@ -80,8 +80,12 @@ class MatchCog(commands.Cog):
     @app_commands.describe(opponent="The user you want to challenge")
     async def start_match(self, interaction: discord.Interaction, opponent: discord.Member):
         """Start a match against another user"""
+        # Defer immediately to avoid interaction timeout
+        await interaction.response.defer(ephemeral=False)
+        
+        # Early validation
         if opponent.bot or opponent.id == interaction.user.id:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ You can't challenge bots or yourself!",
                 ephemeral=True
             )
@@ -89,86 +93,98 @@ class MatchCog(commands.Cog):
         
         # Check if there's already an active match in this channel
         if interaction.channel_id in self.active_matches:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ There's already an active match in this channel!",
                 ephemeral=True
             )
             return
         
-        async with AsyncSessionLocal() as session:
-            # Get both teams
-            player1_team, player1_slots = await self._get_team_data(session, interaction.user.id)
-            player2_team, player2_slots = await self._get_team_data(session, opponent.id)
-            
-            if not player1_team or not player1_slots:
-                await interaction.response.send_message(
-                    "❌ You need a complete team with 11 players to play!",
-                    ephemeral=True
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get both teams
+                player1_team, player1_slots = await self._get_team_data(session, interaction.user.id)
+                player2_team, player2_slots = await self._get_team_data(session, opponent.id)
+                
+                if not player1_team or not player1_slots:
+                    await interaction.followup.send(
+                        "❌ You need a complete team with 11 players to play!",
+                        ephemeral=True
+                    )
+                    return
+                
+                if not player2_team or not player2_slots:
+                    await interaction.followup.send(
+                        f"❌ {opponent.mention} needs a complete team with 11 players to play!",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Create match state
+                match_state = MatchState(
+                    player1_id=interaction.user.id,
+                    player2_id=opponent.id,
+                    player1_team=player1_slots,
+                    player2_team=player2_slots,
+                    player1_formation=player1_team.formation,
+                    player2_formation=player2_team.formation
                 )
-                return
-            
-            if not player2_team or not player2_slots:
-                await interaction.response.send_message(
-                    f"❌ {opponent.mention} needs a complete team with 11 players to play!",
-                    ephemeral=True
+                
+                # Store in active matches
+                self.active_matches[interaction.channel_id] = match_state
+                
+                # Create active match record in database
+                active_match = ActiveMatch(
+                    guild_id=interaction.guild.id,
+                    channel_id=interaction.channel_id,
+                    player1_id=interaction.user.id,
+                    player2_id=opponent.id,
+                    current_round=1,
+                    current_turn_player=interaction.user.id,
+                    game_state={}
                 )
-                return
-            
-            # Create match state
-            match_state = MatchState(
-                player1_id=interaction.user.id,
-                player2_id=opponent.id,
-                player1_team=player1_slots,
-                player2_team=player2_slots,
-                player1_formation=player1_team.formation,
-                player2_formation=player2_team.formation
+                session.add(active_match)
+                await session.commit()
+                
+                # Create match announcement
+                embed = discord.Embed(
+                    title="⚽ Match Started!",
+                    description=f"{interaction.user.mention} vs {opponent.mention}",
+                    color=discord.Color.blue()
+                )
+                embed.add_field(
+                    name="How to Play",
+                    value="Each player selects a card for 11 rounds.\n"
+                          "Odd rounds: Player 1 attacks\n"
+                          "Even rounds: Player 2 attacks\n"
+                          "Attack stat vs Defense stat wins the round!",
+                    inline=False
+                )
+                embed.add_field(
+                    name="Current Turn",
+                    value=f"{interaction.user.mention} - use `/pick <player_name>` to choose!",
+                    inline=False
+                )
+                
+                await interaction.followup.send(embed=embed)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in start_match: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while starting the match.",
+                ephemeral=True
             )
-            
-            # Store in active matches
-            self.active_matches[interaction.channel_id] = match_state
-            
-            # Create active match record in database
-            active_match = ActiveMatch(
-                guild_id=interaction.guild.id,
-                channel_id=interaction.channel_id,
-                player1_id=interaction.user.id,
-                player2_id=opponent.id,
-                current_round=1,
-                current_turn_player=interaction.user.id,
-                game_state={}
-            )
-            session.add(active_match)
-            await session.commit()
-            
-            # Create match announcement
-            embed = discord.Embed(
-                title="⚽ Match Started!",
-                description=f"{interaction.user.mention} vs {opponent.mention}",
-                color=discord.Color.blue()
-            )
-            embed.add_field(
-                name="How to Play",
-                value="Each player selects a card for 11 rounds.\n"
-                      "Odd rounds: Player 1 attacks\n"
-                      "Even rounds: Player 2 attacks\n"
-                      "Attack stat vs Defense stat wins the round!",
-                inline=False
-            )
-            embed.add_field(
-                name="Current Turn",
-                value=f"{interaction.user.mention} - use `/select <player_name>` to choose!",
-                inline=False
-            )
-            
-            await interaction.response.send_message(embed=embed)
     
-    @app_commands.command(name="select", description="Select a player for the current round")
+    @app_commands.command(name="pick", description="Pick a player for the current match round")
     @app_commands.describe(player_name="Name of the player to use this round")
     async def select_player(self, interaction: discord.Interaction, player_name: str):
         """Select a player for the current match round"""
+        # Defer immediately to avoid interaction timeout
+        await interaction.response.defer(ephemeral=True)
+        
         # Check if there's an active match
         if interaction.channel_id not in self.active_matches:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ No active match in this channel!",
                 ephemeral=True
             )
@@ -178,7 +194,7 @@ class MatchCog(commands.Cog):
         
         # Check if it's this user's turn
         if match_state.current_turn != interaction.user.id:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ It's not your turn!",
                 ephemeral=True
             )
@@ -195,7 +211,7 @@ class MatchCog(commands.Cog):
                 break
         
         if not selected_position:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ You don't have an available player matching '{player_name}'!",
                 ephemeral=True
             )
@@ -207,7 +223,7 @@ class MatchCog(commands.Cog):
         # Check if both players have selected
         if match_state.current_turn == match_state.player1_id:
             # Player 1 selected, now wait for player 2
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"✅ You selected **{available_cards[selected_position].name}**!\n"
                 f"Waiting for <@{match_state.player2_id}>...",
                 ephemeral=True
@@ -217,7 +233,7 @@ class MatchCog(commands.Cog):
             player2 = await self.bot.fetch_user(match_state.player2_id)
             embed = discord.Embed(
                 title="⚽ Your Turn!",
-                description=f"Use `/select <player_name>` to choose your player for Round {match_state.current_round}",
+                description=f"Use `/pick <player_name>` to choose your player for Round {match_state.current_round}",
                 color=discord.Color.blue()
             )
             available_p2 = match_state.get_available_cards(match_state.player2_id)
@@ -230,12 +246,13 @@ class MatchCog(commands.Cog):
             
             try:
                 await interaction.channel.send(f"<@{match_state.player2_id}>", embed=embed)
-            except:
+            except Exception as e:
+                import logging
+                logger = logging.getLogger('discord_bot')
+                logger.error(f"Error sending player 2 notification: {e}", exc_info=True)
                 pass
         else:
             # Player 2 selected, now play the round
-            await interaction.response.defer()
-            
             # Get both selected positions
             player1_used = list(match_state.player1_used_cards)
             player2_used = list(match_state.player2_used_cards)
@@ -266,84 +283,99 @@ class MatchCog(commands.Cog):
                 next_player = await self.bot.fetch_user(match_state.current_turn)
                 embed = discord.Embed(
                     title=f"⚽ Round {match_state.current_round}",
-                    description=f"{next_player.mention}, use `/select <player_name>` to choose!",
+                    description=f"{next_player.mention}, use `/pick <player_name>` to choose!",
                     color=discord.Color.blue()
                 )
                 await interaction.channel.send(embed=embed)
     
     async def _complete_match(self, interaction: discord.Interaction, match_state: MatchState):
-        """Complete a match and update records"""
-        async with AsyncSessionLocal() as session:
-            # Get users
-            player1 = await self.bot.fetch_user(match_state.player1_id)
-            player2 = await self.bot.fetch_user(match_state.player2_id)
-            
-            # Create match record
-            winner_id = match_state.get_winner()
-            
-            match_record = Match(
-                guild_id=interaction.guild.id,
-                player1_id=match_state.player1_id,
-                player2_id=match_state.player2_id,
-                player1_score=match_state.player1_score,
-                player2_score=match_state.player2_score,
-                winner_id=winner_id,
-                match_details=json.dumps([r for r in match_state.round_history]),
-                completed_at=discord.utils.utcnow()
-            )
-            session.add(match_record)
-            
-            # Update user stats
-            result = await session.execute(
-                select(User).where(User.id.in_([match_state.player1_id, match_state.player2_id]))
-            )
-            users = result.scalars().all()
-            
-            for user in users:
-                user.total_games += 1
-                if winner_id == user.id:
-                    user.total_wins += 1
-                elif winner_id is None:
-                    user.total_draws += 1
-                else:
-                    user.total_losses += 1
-            
-            # Update leaderboard
-            await self._update_leaderboard(
-                session, interaction.guild.id, match_state.player1_id,
-                won=(winner_id == match_state.player1_id),
-                draw=(winner_id is None)
-            )
-            await self._update_leaderboard(
-                session, interaction.guild.id, match_state.player2_id,
-                won=(winner_id == match_state.player2_id),
-                draw=(winner_id is None)
-            )
-            
-            # Remove active match
-            await session.execute(
-                select(ActiveMatch)
-                .where(ActiveMatch.channel_id == interaction.channel_id)
-            )
-            result = await session.execute(
-                select(ActiveMatch).where(ActiveMatch.channel_id == interaction.channel_id)
-            )
-            active = result.scalar_one_or_none()
-            if active:
-                await session.delete(active)
-            
-            await session.commit()
+        """_complete_match"""
+        # Note: This is a helper function called from within a command that already deferred
+        # Do not defer here as the interaction was already handled
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get users
+                player1 = await self.bot.fetch_user(match_state.player1_id)
+                player2 = await self.bot.fetch_user(match_state.player2_id)
+                
+                # Create match record
+                winner_id = match_state.get_winner()
+                
+                match_record = Match(
+                    guild_id=interaction.guild.id,
+                    player1_id=match_state.player1_id,
+                    player2_id=match_state.player2_id,
+                    player1_score=match_state.player1_score,
+                    player2_score=match_state.player2_score,
+                    winner_id=winner_id,
+                    match_details=json.dumps([r for r in match_state.round_history]),
+                    completed_at=discord.utils.utcnow()
+                )
+                session.add(match_record)
+                
+                # Update user stats
+                result = await session.execute(
+                    select(User).where(User.id.in_([match_state.player1_id, match_state.player2_id]))
+                )
+                users = result.scalars().all()
+                
+                for user in users:
+                    user.total_games += 1
+                    if winner_id == user.id:
+                        user.total_wins += 1
+                    elif winner_id is None:
+                        user.total_draws += 1
+                    else:
+                        user.total_losses += 1
+                
+                # Update leaderboard
+                await self._update_leaderboard(
+                    session, interaction.guild.id, match_state.player1_id,
+                    won=(winner_id == match_state.player1_id),
+                    draw=(winner_id is None)
+                )
+                await self._update_leaderboard(
+                    session, interaction.guild.id, match_state.player2_id,
+                    won=(winner_id == match_state.player2_id),
+                    draw=(winner_id is None)
+                )
+                
+                # Remove active match
+                await session.execute(
+                    select(ActiveMatch)
+                    .where(ActiveMatch.channel_id == interaction.channel_id)
+                )
+                result = await session.execute(
+                    select(ActiveMatch).where(ActiveMatch.channel_id == interaction.channel_id)
+                )
+                active = result.scalar_one_or_none()
+                if active:
+                    await session.delete(active)
+                
+                await session.commit()
+                
+                # Process any active bets
+                await self._process_bets(session, interaction.guild.id, 
+                                        match_state.player1_id, match_state.player2_id, winner_id)
             
             # Show match complete embed
             embed = EmbedBuilder.match_complete_embed(match_state, player1.name, player2.name)
             await interaction.channel.send(embed=embed)
             
-            # Process any active bets
-            await self._process_bets(session, interaction.guild.id, 
-                                    match_state.player1_id, match_state.player2_id, winner_id)
-            
             # Remove from active matches
             del self.active_matches[interaction.channel_id]
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in _complete_match: {e}", exc_info=True)
+            # Try to send error message
+            try:
+                await interaction.channel.send(
+                    "❌ An error occurred while completing the match.",
+                )
+            except:
+                pass
     
     async def _process_bets(self, session: AsyncSession, guild_id: int,
                            player1_id: int, player2_id: int, winner_id: Optional[int]):
@@ -409,102 +441,126 @@ class MatchCog(commands.Cog):
     async def create_bet(self, interaction: discord.Interaction, 
                         opponent: discord.Member, card_name: str):
         """Create or add to a bet"""
+        # Defer immediately to avoid interaction timeout
+        await interaction.response.defer(ephemeral=False)
+        
+        # Early validation
         if opponent.bot or opponent.id == interaction.user.id:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ You can't bet against bots or yourself!",
                 ephemeral=True
             )
             return
         
-        async with AsyncSessionLocal() as session:
-            # Find card in collection
-            result = await session.execute(
-                select(Card, Collection)
-                .join(Collection, Card.id == Collection.card_id)
-                .where(Collection.user_id == interaction.user.id)
-                .where(Card.name.ilike(f"%{card_name}%"))
-            )
-            card_data = result.first()
-            
-            if not card_data:
-                await interaction.response.send_message(
-                    f"❌ You don't have a card matching '{card_name}'!",
-                    ephemeral=True
+        try:
+            async with AsyncSessionLocal() as session:
+                # Find card in collection
+                result = await session.execute(
+                    select(Card, Collection)
+                    .join(Collection, Card.id == Collection.card_id)
+                    .where(Collection.user_id == interaction.user.id)
+                    .where(Card.name.ilike(f"%{card_name}%"))
                 )
-                return
-            
-            card, _ = card_data
-            
-            # Check for existing bet
-            result = await session.execute(
-                select(Bet)
-                .where(Bet.guild_id == interaction.guild.id)
-                .where(Bet.creator_id == interaction.user.id)
-                .where(Bet.challenged_id == opponent.id)
-                .where(Bet.accepted == False)
-            )
-            existing_bet = result.scalar_one_or_none()
-            
-            if existing_bet:
-                # Add to existing bet
-                if len(existing_bet.creator_cards) >= 3:
-                    await interaction.response.send_message(
-                        "❌ You can only bet up to 3 cards!",
+                card_data = result.first()
+                
+                if not card_data:
+                    await interaction.followup.send(
+                        f"❌ You don't have a card matching '{card_name}'!",
                         ephemeral=True
                     )
                     return
                 
-                existing_bet.creator_cards.append(card.id)
-                await session.commit()
+                card, _ = card_data
                 
-                await interaction.response.send_message(
-                    f"✅ Added **{card.name}** to your bet against {opponent.mention}!",
-                    ephemeral=True
+                # Check for existing bet
+                result = await session.execute(
+                    select(Bet)
+                    .where(Bet.guild_id == interaction.guild.id)
+                    .where(Bet.creator_id == interaction.user.id)
+                    .where(Bet.challenged_id == opponent.id)
+                    .where(Bet.accepted == False)
                 )
-            else:
-                # Create new bet
-                new_bet = Bet(
-                    guild_id=interaction.guild.id,
-                    creator_id=interaction.user.id,
-                    challenged_id=opponent.id,
-                    creator_cards=[card.id],
-                    challenged_cards=[]
-                )
-                session.add(new_bet)
-                await session.commit()
+                existing_bet = result.scalar_one_or_none()
                 
-                embed = discord.Embed(
-                    title="🎲 New Bet Created!",
-                    description=f"{interaction.user.mention} has challenged {opponent.mention} to a bet!",
-                    color=discord.Color.gold()
-                )
-                embed.add_field(name="Wagered Card", value=f"**{card.name}**", inline=False)
-                embed.add_field(
-                    name="To Accept",
-                    value=f"{opponent.mention}, use `/bet {interaction.user.mention} <card_name>` to match the bet!",
-                    inline=False
-                )
-                
-                await interaction.response.send_message(embed=embed)
+                if existing_bet:
+                    # Add to existing bet
+                    if len(existing_bet.creator_cards) >= 3:
+                        await interaction.followup.send(
+                            "❌ You can only bet up to 3 cards!",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    existing_bet.creator_cards.append(card.id)
+                    await session.commit()
+                    
+                    await interaction.followup.send(
+                        f"✅ Added **{card.name}** to your bet against {opponent.mention}!",
+                        ephemeral=True
+                    )
+                else:
+                    # Create new bet
+                    new_bet = Bet(
+                        guild_id=interaction.guild.id,
+                        creator_id=interaction.user.id,
+                        challenged_id=opponent.id,
+                        creator_cards=[card.id],
+                        challenged_cards=[]
+                    )
+                    session.add(new_bet)
+                    await session.commit()
+                    
+                    embed = discord.Embed(
+                        title="🎲 New Bet Created!",
+                        description=f"{interaction.user.mention} has challenged {opponent.mention} to a bet!",
+                        color=discord.Color.gold()
+                    )
+                    embed.add_field(name="Wagered Card", value=f"**{card.name}**", inline=False)
+                    embed.add_field(
+                        name="To Accept",
+                        value=f"{opponent.mention}, use `/bet {interaction.user.mention} <card_name>` to match the bet!",
+                        inline=False
+                    )
+                    
+                    await interaction.followup.send(embed=embed)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in create_bet: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while creating the bet.",
+                ephemeral=True
+            )
     
     @app_commands.command(name="leaderboard", description="View the server leaderboard")
     async def view_leaderboard(self, interaction: discord.Interaction):
-        """Show server leaderboard"""
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(Leaderboard, User)
-                .join(User, Leaderboard.user_id == User.id)
-                .where(Leaderboard.guild_id == interaction.guild.id)
-                .order_by(Leaderboard.points.desc())
+        """view_leaderboard"""
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(Leaderboard, User)
+                    .join(User, Leaderboard.user_id == User.id)
+                    .where(Leaderboard.guild_id == interaction.guild.id)
+                    .order_by(Leaderboard.points.desc())
+                )
+                entries = result.all()
+                
+                embed = EmbedBuilder.leaderboard_embed(
+                    interaction.guild.name,
+                    [(user, lb) for lb, user in entries]
+                )
+                
+                await interaction.followup.send(embed=embed)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in view_leaderboard: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while fetching the leaderboard.",
+                ephemeral=True
             )
-            entries = result.all()
-            
-            embed = EmbedBuilder.leaderboard_embed(
-                interaction.guild.name,
-                [(user, lb) for lb, user in entries]
-            )
-            
-            await interaction.response.send_message(embed=embed)
 
 async def setup(bot):
     await bot.add_cog(MatchCog(bot))
