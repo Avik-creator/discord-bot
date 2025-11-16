@@ -15,7 +15,20 @@ class CardSpawner:
         self.bot = bot
         self.active_spawns = {}  # {message_id: card_data}
     
-    async def increment_message_count(self, session: AsyncSession, guild_id: int):
+    async def has_active_spawn(self, session: AsyncSession, channel_id: int) -> bool:
+        """Check if there's already an active (uncaught) spawn in this channel"""
+        now = discord.utils.utcnow()
+        result = await session.execute(
+            select(SpawnedCard)
+            .where(SpawnedCard.channel_id == channel_id)
+            .where(SpawnedCard.caught == False)
+            .where(SpawnedCard.expires_at > now)
+        )
+        # Use first() instead of scalar_one_or_none() since there can be multiple active spawns
+        active_spawn = result.first()
+        return active_spawn is not None
+    
+    async def increment_message_count(self, session: AsyncSession, guild_id: int, channel_id: int):
         """Increment message count and check if card should spawn"""
         # Get or create server config
         result = await session.execute(
@@ -27,6 +40,14 @@ class CardSpawner:
             return False, None
         
         if not server_config.spawn_enabled or not server_config.spawn_channel_id:
+            return False, None
+        
+        # Only count messages in the spawn channel
+        if channel_id != server_config.spawn_channel_id:
+            return False, None
+        
+        # Check if there's already an active spawn in this channel
+        if await self.has_active_spawn(session, channel_id):
             return False, None
         
         # Increment message count
@@ -55,8 +76,12 @@ class CardSpawner:
         await session.commit()
         return False, None
     
-    async def spawn_card(self, session: AsyncSession, guild_id: int, channel_id: int) -> Optional[discord.Message]:
+    async def spawn_card(self, session: AsyncSession, guild_id: int, channel_id: int, bypass_active_check: bool = False) -> Optional[discord.Message]:
         """Spawn a random card in the channel"""
+        # Double-check there's no active spawn before spawning (unless bypassed for admin commands)
+        if not bypass_active_check and await self.has_active_spawn(session, channel_id):
+            return None
+        
         try:
             # Get random card from database
             result = await session.execute(select(Card))
@@ -82,12 +107,15 @@ class CardSpawner:
             
             # Add some hints without revealing full name
             name_hint = card.name[0] + "*" * (len(card.name) - 2) + card.name[-1]
-            embed.add_field(name="Hint", value=name_hint, inline=False)
+            
+            # Build hint text with name and club if available
+            hint_text = f"**Name:** {name_hint}"
+            if card.club:
+                hint_text += f"\n**Club:** {card.club}"
+            
+            embed.add_field(name="💡 Hint", value=hint_text, inline=False)
             embed.add_field(name="Position", value=card.position, inline=True)
             embed.add_field(name="Rating", value=f"{card.overall_rating} OVR", inline=True)
-            
-            if card.club:
-                embed.add_field(name="Club", value=card.club, inline=True)
             
             embed.set_footer(text=f"You have {config.CATCH_TIMEOUT_SECONDS} seconds to catch this card!")
             

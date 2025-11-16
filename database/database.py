@@ -3,6 +3,9 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy.pool import NullPool
 import config
 import ssl
+import logging
+
+logger = logging.getLogger('discord_bot')
 
 Base = declarative_base()
 
@@ -32,10 +35,46 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False
 )
 
+async def migrate_add_is_admin():
+    """Add is_admin column to users table if it doesn't exist"""
+    from sqlalchemy import text
+    
+    try:
+        async with engine.begin() as conn:
+            # Check if column already exists
+            check_query = text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'users' 
+                AND column_name = 'is_admin'
+            """)
+            
+            result = await conn.execute(check_query)
+            column_exists = result.fetchone() is not None
+            
+            if not column_exists:
+                # Add the column with default value False
+                alter_query = text("""
+                    ALTER TABLE users 
+                    ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE
+                """)
+                
+                await conn.execute(alter_query)
+                logger.info("✅ Added is_admin column to users table")
+            else:
+                logger.debug("is_admin column already exists")
+    except Exception as e:
+        logger.error(f"Error adding is_admin column: {e}", exc_info=True)
+        # Don't raise - allow bot to continue even if migration fails
+        # The column might already exist or there might be a permission issue
+
 async def init_db():
-    """Initialize database tables"""
+    """Initialize database tables and run migrations"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    
+    # Run migrations
+    await migrate_add_is_admin()
 
 async def get_session() -> AsyncSession:
     """Get a database session"""

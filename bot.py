@@ -104,16 +104,16 @@ class FootballCardBot(commands.Bot):
         # Check if this should trigger a spawn
         async with AsyncSessionLocal() as session:
             should_spawn, channel_id = await self.card_spawner.increment_message_count(
-                session, message.guild.id
+                session, message.guild.id, message.channel.id
             )
             
             if should_spawn and channel_id:
                 # Spawn card in configured channel
                 try:
                     await self.card_spawner.spawn_card(session, message.guild.id, channel_id)
-                    logger.info(f"Spawned card in guild {message.guild.id}")
+                    logger.info(f"Spawned card in guild {message.guild.id}, channel {channel_id}")
                 except Exception as e:
-                    logger.error(f"Error spawning card: {e}")
+                    logger.error(f"Error spawning card: {e}", exc_info=True)
         
         # Process commands (if any)
         await self.process_commands(message)
@@ -180,40 +180,66 @@ class FootballCardBot(commands.Bot):
         logger.error(f"Application command error: {error}", exc_info=True)
         
         try:
+            # Handle specific error types with user-friendly messages
             if isinstance(error, discord.app_commands.MissingPermissions):
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        "❌ You don't have permission to use this command!",
-                        ephemeral=True
-                    )
-                else:
-                    await interaction.followup.send(
-                        "❌ You don't have permission to use this command!",
-                        ephemeral=True
-                    )
+                error_msg = "❌ You don't have permission to use this command!"
             elif isinstance(error, discord.app_commands.CommandOnCooldown):
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        f"⏰ This command is on cooldown. Try again in {error.retry_after:.1f}s",
-                        ephemeral=True
-                    )
+                # Format cooldown time nicely
+                retry_after = int(error.retry_after)
+                if retry_after < 60:
+                    time_str = f"{retry_after}s"
+                elif retry_after < 3600:
+                    minutes = retry_after // 60
+                    seconds = retry_after % 60
+                    time_str = f"{minutes}m {seconds}s" if seconds > 0 else f"{minutes}m"
+                elif retry_after < 86400:
+                    hours = retry_after // 3600
+                    minutes = (retry_after % 3600) // 60
+                    time_str = f"{hours}h {minutes}m" if minutes > 0 else f"{hours}h"
                 else:
-                    await interaction.followup.send(
-                        f"⏰ This command is on cooldown. Try again in {error.retry_after:.1f}s",
-                        ephemeral=True
-                    )
+                    days = retry_after // 86400
+                    hours = (retry_after % 86400) // 3600
+                    time_str = f"{days}d {hours}h" if hours > 0 else f"{days}d"
+                error_msg = f"⏰ This command is on cooldown. Try again in **{time_str}**"
+            elif isinstance(error, discord.app_commands.CheckFailure):
+                error_msg = "❌ You don't meet the requirements to use this command."
+            elif isinstance(error, discord.app_commands.CommandNotFound):
+                error_msg = "❌ Command not found. Please check the command name and try again."
+            elif isinstance(error, discord.Forbidden):
+                error_msg = "❌ I don't have permission to perform this action. Please check my permissions."
+            elif isinstance(error, discord.NotFound):
+                error_msg = "❌ The requested resource was not found. It may have been deleted."
+            elif isinstance(error, discord.HTTPException):
+                # Provide user-friendly message for HTTP errors
+                if error.status == 403:
+                    error_msg = "❌ I don't have permission to perform this action."
+                elif error.status == 404:
+                    error_msg = "❌ The requested resource was not found."
+                elif error.status == 429:
+                    error_msg = "⏰ Too many requests! Please wait a moment and try again."
+                elif error.status >= 500:
+                    error_msg = "❌ Discord is experiencing issues. Please try again in a few moments."
+                else:
+                    error_msg = "❌ An error occurred while processing your request. Please try again."
             else:
-                error_msg = f"❌ An error occurred: {str(error)}"
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        error_msg,
-                        ephemeral=True
-                    )
-                else:
-                    await interaction.followup.send(
-                        error_msg,
-                        ephemeral=True
-                    )
+                # For unknown errors, provide a generic but helpful message
+                error_type = type(error).__name__
+                error_msg = (
+                    f"❌ An unexpected error occurred.\n"
+                    f"Please try again, or contact support if the issue persists."
+                )
+            
+            # Send the error message
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    error_msg,
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    error_msg,
+                    ephemeral=True
+                )
         except Exception as e:
             logger.error(f"Error sending error message: {e}")
 

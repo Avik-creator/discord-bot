@@ -36,6 +36,9 @@ class User(Base):
     booster_pack_cooldown = Column(DateTime(timezone=True), nullable=True)
     vote_cooldown = Column(DateTime(timezone=True), nullable=True)
     
+    # Admin status
+    is_admin = Column(Boolean, default=False, nullable=False)
+    
     # Relationships
     collections = relationship("Collection", back_populates="user", cascade="all, delete-orphan")
     teams = relationship("Team", back_populates="user", cascade="all, delete-orphan")

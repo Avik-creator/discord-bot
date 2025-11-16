@@ -7,6 +7,77 @@ from database.database import AsyncSessionLocal
 from database.models import User, Card, Collection, PromoCode, Logo, CardType, LogoRarity, ServerConfig
 from utils.card_spawner import CardSpawner
 import random
+import asyncio
+import logging
+
+async def is_admin_check(interaction: discord.Interaction) -> bool:
+    """Check if user is admin (either Discord admin, database admin, or bot owner)"""
+    # Check if user is bot owner (highest priority)
+    try:
+        if await interaction.client.is_owner(interaction.user):
+            return True
+    except Exception:
+        pass
+    
+    # Check Discord server administrator permission
+    # This is the most important check - Discord server admins should have full access
+    try:
+        # Ensure we're in a guild context
+        if interaction.guild is not None:
+            # Check if user is the guild owner (guild owners are always admins)
+            if interaction.guild.owner_id == interaction.user.id:
+                return True
+            
+            # Get the member object to check permissions
+            # In guild contexts, interaction.user is usually already a Member
+            member = None
+            if isinstance(interaction.user, discord.Member):
+                member = interaction.user
+            else:
+                # If it's a User object, try to get the Member
+                member = interaction.guild.get_member(interaction.user.id)
+                if member is None:
+                    # If member not in cache, fetch it
+                    try:
+                        member = await interaction.guild.fetch_member(interaction.user.id)
+                    except:
+                        pass
+            
+            # Check if user has administrator permission
+            if member and hasattr(member, 'guild_permissions'):
+                if member.guild_permissions.administrator:
+                    return True
+    except Exception as e:
+        # Log the error for debugging but don't fail
+        import logging
+        logger = logging.getLogger('discord_bot')
+        logger.debug(f"Error checking Discord admin permissions for user {interaction.user.id}: {e}")
+    
+    # Check database admin status (for non-Discord admins who were granted admin via /admin_manage)
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(User).where(User.id == interaction.user.id)
+            )
+            user = result.scalar_one_or_none()
+            if user and hasattr(user, 'is_admin') and user.is_admin:
+                return True
+    except Exception as e:
+        # Log the error for debugging
+        import logging
+        logger = logging.getLogger('discord_bot')
+        logger.debug(f"Error checking database admin status for user {interaction.user.id}: {e}")
+    
+    return False
+
+async def can_manage_admins(interaction: discord.Interaction) -> bool:
+    """Check if user can manage admins (bot owner or existing admin)"""
+    # Bot owner can always manage admins
+    if await interaction.client.is_owner(interaction.user):
+        return True
+    
+    # Check if user is admin (Discord or database)
+    return await is_admin_check(interaction)
 
 class AdminCog(commands.Cog):
     """Admin commands"""
@@ -16,7 +87,7 @@ class AdminCog(commands.Cog):
         self.card_spawner = CardSpawner(bot)
     
     @app_commands.command(name="admin_spawn", description="[ADMIN] Spawn 15 cards at once")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def admin_spawn(self, interaction: discord.Interaction):
         """admin_spawn"""
         await interaction.response.defer(ephemeral=False)
@@ -38,21 +109,69 @@ class AdminCog(commands.Cog):
                 
                 channel_id = server_config.spawn_channel_id
                 
+                # Get the channel to verify it exists and bot has permissions
+                channel = self.bot.get_channel(channel_id)
+                if not channel:
+                    # Try fetching the channel if not in cache
+                    try:
+                        channel = await self.bot.fetch_channel(channel_id)
+                    except Exception as e:
+                        await interaction.followup.send(
+                            f"❌ Could not find channel with ID {channel_id}. Please check the configured spawn channel.",
+                            ephemeral=True
+                        )
+                        logger = logging.getLogger('discord_bot')
+                        logger.error(f"Error fetching channel {channel_id}: {e}")
+                        return
+                
+                # Check bot permissions
+                if not channel.permissions_for(interaction.guild.me).send_messages:
+                    await interaction.followup.send(
+                        f"❌ I don't have permission to send messages in {channel.mention}!",
+                        ephemeral=True
+                    )
+                    return
+                
                 await interaction.followup.send("🔄 Spawning 15 cards...", ephemeral=True)
                 
-                # Spawn 15 cards
+                # Spawn 15 cards with a small delay between each to avoid rate limits
+                spawned_count = 0
+                logger = logging.getLogger('discord_bot')
+                
                 for i in range(15):
-                    await self.card_spawner.spawn_card(session, interaction.guild.id, channel_id)
+                    try:
+                        # Use a new session for each spawn to avoid conflicts
+                        async with AsyncSessionLocal() as spawn_session:
+                            message = await self.card_spawner.spawn_card(
+                                spawn_session, 
+                                interaction.guild.id, 
+                                channel_id,
+                                bypass_active_check=True  # Allow multiple spawns for admin command
+                            )
+                            if message:
+                                spawned_count += 1
+                            else:
+                                logger.warning(f"Failed to spawn card {i+1}/15")
+                        # Small delay to avoid rate limits
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        logger.error(f"Error spawning card {i+1}/15: {e}", exc_info=True)
                 
                 embed = discord.Embed(
                     title="✅ Cards Spawned!",
-                    description=f"Successfully spawned 15 cards in <#{channel_id}>!",
-                    color=discord.Color.green()
+                    description=f"Successfully spawned {spawned_count} out of 15 cards in {channel.mention}!",
+                    color=discord.Color.green() if spawned_count == 15 else discord.Color.orange()
                 )
+                
+                if spawned_count < 15:
+                    embed.add_field(
+                        name="⚠️ Note",
+                        value=f"{15 - spawned_count} cards failed to spawn. Check logs for details.",
+                        inline=False
+                    )
                 
                 await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
-            import logging
             logger = logging.getLogger('discord_bot')
             logger.error(f"Error in admin_spawn: {e}", exc_info=True)
             await interaction.followup.send(
@@ -65,7 +184,7 @@ class AdminCog(commands.Cog):
         user="The user to give the card to",
         card_name="Name of the card"
     )
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def give_user_card(self, interaction: discord.Interaction, 
                             user: discord.Member, card_name: str):
         """give_user_card"""
@@ -107,6 +226,20 @@ class AdminCog(commands.Cog):
                     db_user = User(id=user.id, username=user.name)
                     session.add(db_user)
                     await session.flush()
+                
+                # Check if user already has this card
+                existing_collection = await session.execute(
+                    select(Collection).where(
+                        Collection.user_id == user.id,
+                        Collection.card_id == card.id
+                    )
+                )
+                if existing_collection.scalar_one_or_none():
+                    await interaction.followup.send(
+                        f"ℹ️ {user.mention} already has **{card.name}** in their collection!",
+                        ephemeral=True
+                    )
+                    return
                 
                 # Add to collection
                 collection_entry = Collection(
@@ -165,7 +298,7 @@ class AdminCog(commands.Cog):
         user="The user to give cards to",
         club_name="Name of the club"
     )
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def give_club(self, interaction: discord.Interaction, 
                        user: discord.Member, club_name: str):
         """give_club"""
@@ -230,7 +363,7 @@ class AdminCog(commands.Cog):
         user="The user to give cards to",
         event_type="Type of event (TOTW, TOTS, TOTY, etc.)"
     )
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def give_event(self, interaction: discord.Interaction, 
                         user: discord.Member, event_type: str):
         """give_event"""
@@ -294,7 +427,7 @@ class AdminCog(commands.Cog):
     
     @app_commands.command(name="give_full", description="[ADMIN] Give every card except premium")
     @app_commands.describe(user="The user to give all cards to")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def give_full(self, interaction: discord.Interaction, user: discord.Member):
         """Give all cards to a user"""
         await interaction.response.defer(ephemeral=True)
@@ -355,7 +488,7 @@ class AdminCog(commands.Cog):
         app_commands.Choice(name="Random Event Card", value="pack_event"),
         app_commands.Choice(name="Specific Card", value="card"),
     ])
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def promo_add(self, interaction: discord.Interaction, code: str, 
                        reward_type: str, card_name: str = None, max_uses: int = None):
         """promo_add"""
@@ -446,7 +579,7 @@ class AdminCog(commands.Cog):
     
     @app_commands.command(name="promo_remove", description="[ADMIN] Remove a promo code")
     @app_commands.describe(code="The promo code to remove")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def promo_remove(self, interaction: discord.Interaction, code: str):
         """promo_remove"""
         await interaction.response.defer(ephemeral=False)
@@ -495,7 +628,7 @@ class AdminCog(commands.Cog):
         app_commands.Choice(name="Rare (+2 OVR)", value="rare"),
         app_commands.Choice(name="Legendary (+3 OVR)", value="legendary"),
     ])
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def logo_add(self, interaction: discord.Interaction, 
                       name: str, bonus: int, rarity: str):
         """Add a logo to the game"""
@@ -543,7 +676,7 @@ class AdminCog(commands.Cog):
     
     @app_commands.command(name="logo_remove", description="[ADMIN] Remove a logo from the game")
     @app_commands.describe(name="Name of the logo to remove")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def logo_remove(self, interaction: discord.Interaction, name: str):
         """logo_remove"""
         await interaction.response.defer(ephemeral=False)
@@ -581,8 +714,108 @@ class AdminCog(commands.Cog):
                 ephemeral=True
             )
     
+    @app_commands.command(name="admin_manage", description="[ADMIN] Grant or revoke admin status to a user")
+    @app_commands.describe(
+        user="The user to grant or revoke admin status",
+        action="Grant or revoke admin status"
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="Grant Admin", value="grant"),
+        app_commands.Choice(name="Revoke Admin", value="revoke"),
+    ])
+    async def admin_manage(self, interaction: discord.Interaction, user: discord.User, action: str):
+        """Manage admin status for users"""
+        # Check if user can manage admins
+        if not await can_manage_admins(interaction):
+            await interaction.response.send_message(
+                "❌ You don't have permission to manage admins! Only bot owners and existing admins can use this command.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get or create user
+                result = await session.execute(
+                    select(User).where(User.id == user.id)
+                )
+                db_user = result.scalar_one_or_none()
+                
+                if not db_user:
+                    db_user = User(id=user.id, username=user.name, is_admin=False)
+                    session.add(db_user)
+                    await session.flush()
+                
+                if action == "grant":
+                    if db_user.is_admin:
+                        await interaction.followup.send(
+                            f"ℹ️ {user.mention} is already an admin!",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    db_user.is_admin = True
+                    embed = discord.Embed(
+                        title="✅ Admin Granted!",
+                        description=f"**{user.mention}** has been granted admin status!",
+                        color=discord.Color.green()
+                    )
+                else:  # revoke
+                    if not db_user.is_admin:
+                        await interaction.followup.send(
+                            f"ℹ️ {user.mention} is not an admin!",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    # Prevent revoking your own admin status (unless you're bot owner)
+                    if user.id == interaction.user.id and not await interaction.client.is_owner(interaction.user):
+                        await interaction.followup.send(
+                            "❌ You cannot revoke your own admin status!",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    db_user.is_admin = False
+                    embed = discord.Embed(
+                        title="✅ Admin Revoked!",
+                        description=f"**{user.mention}** has had their admin status revoked.",
+                        color=discord.Color.orange()
+                    )
+                
+                # Send interaction response - if this fails, we won't commit
+                try:
+                    await interaction.followup.send(embed=embed)
+                    # Only commit if interaction response succeeds
+                    await session.commit()
+                except Exception as send_error:
+                    # Rollback if interaction fails
+                    await session.rollback()
+                    import logging
+                    logger = logging.getLogger('discord_bot')
+                    logger.error(f"Failed to send admin_manage response, rolled back transaction: {send_error}")
+                    # Try to send error message (might also fail, but worth trying)
+                    try:
+                        await interaction.followup.send(
+                            "❌ Admin status updated but failed to display.",
+                            ephemeral=True
+                        )
+                    except:
+                        pass
+                    raise
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in admin_manage: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while managing admin status.",
+                ephemeral=True
+            )
+    
     @app_commands.command(name="sync_commands", description="[ADMIN] Sync bot commands to this server")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.check(is_admin_check)
     async def sync_commands(self, interaction: discord.Interaction):
         """Sync commands to the current server"""
         await interaction.response.defer(ephemeral=True)

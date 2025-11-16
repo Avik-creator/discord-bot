@@ -17,6 +17,28 @@ class CollectionCog(commands.Cog):
         self.bot = bot
         self.api_football = APIFootball()
     
+    def _format_time(self, seconds: int) -> str:
+        """Format seconds into a human-readable time string (e.g., '23h 45m 30s' or '6d 12h 30m')"""
+        if seconds <= 0:
+            return "0s"
+        
+        days = seconds // 86400
+        hours = (seconds % 86400) // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        
+        parts = []
+        if days > 0:
+            parts.append(f"{days}d")
+        if hours > 0:
+            parts.append(f"{hours}h")
+        if minutes > 0:
+            parts.append(f"{minutes}m")
+        if secs > 0 and days == 0:  # Only show seconds if less than a day
+            parts.append(f"{secs}s")
+        
+        return " ".join(parts) if parts else "0s"
+    
     async def _check_cooldown(self, user: User, cooldown_type: str) -> tuple[bool, int]:
         """Check if cooldown has expired. Returns (can_use, seconds_remaining)"""
         cooldown_field = f"{cooldown_type}_cooldown"
@@ -97,10 +119,11 @@ class CollectionCog(commands.Cog):
                 can_use, seconds_remaining = await self._check_cooldown(user, pack_type)
                 
                 if not can_use:
-                    hours = seconds_remaining // 3600
-                    minutes = (seconds_remaining % 3600) // 60
+                    time_str = self._format_time(seconds_remaining)
+                    pack_name = pack_type.replace("_", " ").title()
                     await interaction.followup.send(
-                        f"⏰ This pack is on cooldown! Try again in {hours}h {minutes}m",
+                        f"⏰ **{pack_name}** is on cooldown!\n"
+                        f"⏳ Time remaining: **{time_str}**",
                         ephemeral=True
                     )
                     return
@@ -336,10 +359,9 @@ class CollectionCog(commands.Cog):
                 can_use, seconds_remaining = await self._check_cooldown(user, 'vote')
                 
                 if not can_use:
-                    hours = seconds_remaining // 3600
-                    minutes = (seconds_remaining % 3600) // 60
+                    time_str = self._format_time(seconds_remaining)
                     await interaction.followup.send(
-                        f"⏰ You can vote again in {hours}h {minutes}m",
+                        f"⏰ You can vote again in **{time_str}**",
                         ephemeral=True
                     )
                     return
@@ -532,6 +554,70 @@ class CollectionCog(commands.Cog):
         )
         
         await interaction.response.send_message(embed=embed)
+    
+    @app_commands.command(name="pack_timer", description="Check cooldown timers for daily and weekly packs")
+    async def pack_timer(self, interaction: discord.Interaction):
+        """Show cooldown timers for daily and weekly packs"""
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get or create user
+                result = await session.execute(
+                    select(User).where(User.id == interaction.user.id)
+                )
+                user = result.scalar_one_or_none()
+                
+                if not user:
+                    user = User(id=interaction.user.id, username=interaction.user.name)
+                    session.add(user)
+                    await session.flush()
+                
+                # Check cooldowns for daily and weekly packs
+                daily_can_use, daily_remaining = await self._check_cooldown(user, 'daily_pack')
+                weekly_can_use, weekly_remaining = await self._check_cooldown(user, 'weekly_pack')
+                
+                embed = discord.Embed(
+                    title="⏰ Pack Cooldown Timers",
+                    description="Check when you can open your next packs!",
+                    color=discord.Color.blue()
+                )
+                
+                # Daily pack status
+                if daily_can_use:
+                    daily_status = "✅ **Ready to open!**"
+                else:
+                    daily_time = self._format_time(daily_remaining)
+                    daily_status = f"⏳ **{daily_time}** remaining"
+                
+                embed.add_field(
+                    name="📦 Daily Pack",
+                    value=daily_status,
+                    inline=False
+                )
+                
+                # Weekly pack status
+                if weekly_can_use:
+                    weekly_status = "✅ **Ready to open!**"
+                else:
+                    weekly_time = self._format_time(weekly_remaining)
+                    weekly_status = f"⏳ **{weekly_time}** remaining"
+                
+                embed.add_field(
+                    name="📦 Weekly Pack",
+                    value=weekly_status,
+                    inline=False
+                )
+                
+                await interaction.followup.send(embed=embed)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in pack_timer: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while checking pack timers.",
+                ephemeral=True
+            )
 
 async def setup(bot):
     await bot.add_cog(CollectionCog(bot))
