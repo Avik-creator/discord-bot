@@ -133,7 +133,7 @@ class EmbedBuilder:
     
     @staticmethod
     def match_round_embed(round_data: Dict, player1_name: str, player2_name: str) -> discord.Embed:
-        """Create an embed for a match round result"""
+        """Create embed for match round result"""
         embed = discord.Embed(
             title=f"⚽ Round {round_data['round']} Result",
             color=discord.Color.blue()
@@ -141,34 +141,85 @@ class EmbedBuilder:
         
         details = round_data['details']
         
-        # Player 1 info
-        p1_text = (
-            f"**{round_data['player1_card']}** ({round_data['player1_position']})\n"
-            f"Attack: {details['attacker']['effective_attack']} (Roll: {details['attacker']['roll']})"
-        )
-        embed.add_field(name=f"🔵 {player1_name}", value=p1_text, inline=True)
+        # CRITICAL FIX: Always show Player 1 vs Player 2, not Attacker vs Defender
+        # Use attacking_player from round_data if available, otherwise calculate from round number
+        attacking_player = round_data.get('attacking_player', 1 if round_data['round'] % 2 == 1 else 2)
         
-        # VS
-        embed.add_field(name="⚔️", value="VS", inline=True)
-        
-        # Player 2 info
-        p2_text = (
-            f"**{round_data['player2_card']}** ({round_data['player2_position']})\n"
-            f"Defense: {details['defender']['effective_defense']} (Roll: {details['defender']['roll']})"
-        )
-        embed.add_field(name=f"🔴 {player2_name}", value=p2_text, inline=True)
-        
-        # Result
-        result = details['result']
-        if result == 'attacker_wins':
-            winner = player1_name
-        elif result == 'defender_wins':
-            winner = player2_name
+        if attacking_player == 1:
+            # Player 1 attacked (odd round)
+            player1_card_name = round_data['player1_card']
+            player1_stat_label = "Attack"
+            player1_roll = details['attacker']['roll']
+            player1_effective = details['attacker']['effective_attack']
+            
+            player2_card_name = round_data['player2_card']
+            player2_stat_label = "Defense"
+            player2_roll = details['defender']['roll']
+            player2_effective = details['defender']['effective_defense']
+            
+            # Determine winner based on attacker_wins/defender_wins
+            if details['result'] == 'attacker_wins':
+                winner = player1_name
+            elif details['result'] == 'defender_wins':
+                winner = player2_name
+            else:
+                winner = "Draw"
         else:
-            winner = "Draw"
+            # Player 2 attacked (even round)
+            player1_card_name = round_data['player1_card']
+            player1_stat_label = "Defense"
+            player1_roll = details['defender']['roll']
+            player1_effective = details['defender']['effective_defense']
+            
+            player2_card_name = round_data['player2_card']
+            player2_stat_label = "Attack"
+            player2_roll = details['attacker']['roll']
+            player2_effective = details['attacker']['effective_attack']
+            
+            # Determine winner based on attacker_wins/defender_wins
+            if details['result'] == 'attacker_wins':
+                winner = player2_name
+            elif details['result'] == 'defender_wins':
+                winner = player1_name
+            else:
+                winner = "Draw"
         
-        embed.add_field(name="Winner", value=f"🏆 {winner}", inline=False)
-        embed.add_field(name="Current Score", value=round_data['score'], inline=False)
+        # Player 1 field
+        embed.add_field(
+            name=f"🔵 {player1_name}",
+            value=f"**{player1_card_name}** ({round_data['player1_position']})\n"
+                  f"{player1_stat_label}: {player1_effective} (Roll: {player1_roll})",
+            inline=True
+        )
+        
+        # VS field
+        embed.add_field(
+            name="⚔️",
+            value="VS",
+            inline=True
+        )
+        
+        # Player 2 field
+        embed.add_field(
+            name=f"🔴 {player2_name}",
+            value=f"**{player2_card_name}** ({round_data['player2_position']})\n"
+                  f"{player2_stat_label}: {player2_effective} (Roll: {player2_roll})",
+            inline=True
+        )
+        
+        # Winner field
+        embed.add_field(
+            name="Winner",
+            value=f"🏆 {winner}",
+            inline=False
+        )
+        
+        # Current Score field
+        embed.add_field(
+            name="Current Score",
+            value=round_data['score'],
+            inline=False
+        )
         
         return embed
     

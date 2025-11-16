@@ -163,78 +163,161 @@ class MatchState:
         self.player1_score = 0
         self.player2_score = 0
         
-        self.player1_used_cards = set()
-        self.player2_used_cards = set()
+        self.player1_used_cards = set()  # Set of positions used
+        self.player2_used_cards = set()  # Set of positions used
+        self.player1_used_card_ids = set()  # Set of card IDs used (for validation)
+        self.player2_used_card_ids = set()  # Set of card IDs used (for validation)
         
         self.round_history = []
+        self.round_winners = []  # Track who won each round for verification
         
         self.current_turn = player1_id  # Who selects next
     
     def get_available_cards(self, player_id: int) -> Dict:
         """Get cards that haven't been used yet"""
         if player_id == self.player1_id:
-            used = self.player1_used_cards
+            used_positions = self.player1_used_cards
+            used_card_ids = self.player1_used_card_ids
             team = self.player1_team
         else:
-            used = self.player2_used_cards
+            used_positions = self.player2_used_cards
+            used_card_ids = self.player2_used_card_ids
             team = self.player2_team
         
-        return {pos: card for pos, card in team.items() if pos not in used}
+        # Filter out cards that have been used (by position or by card ID)
+        available = {}
+        for pos, card in team.items():
+            if pos not in used_positions and card.id not in used_card_ids:
+                available[pos] = card
+        
+        return available
     
     def select_card(self, player_id: int, position: str) -> bool:
         """Mark a card as selected for this round"""
+        import logging
+        logger = logging.getLogger('discord_bot')
+        
         available = self.get_available_cards(player_id)
         
         if position not in available:
+            logger.error(f"select_card: Position {position} not in available cards for player {player_id}")
+            logger.error(f"Available positions: {list(available.keys())}")
+            if player_id == self.player1_id:
+                logger.error(f"Player 1 used positions: {self.player1_used_cards}, used card IDs: {self.player1_used_card_ids}")
+            else:
+                logger.error(f"Player 2 used positions: {self.player2_used_cards}, used card IDs: {self.player2_used_card_ids}")
             return False
         
+        # Get the card being selected
         if player_id == self.player1_id:
+            card = self.player1_team[position]
+            # Double-check it's not already used
+            if position in self.player1_used_cards or card.id in self.player1_used_card_ids:
+                logger.error(f"select_card: Card {card.name} (ID: {card.id}) at position {position} is already used for player 1!")
+                return False
             self.player1_used_cards.add(position)
+            self.player1_used_card_ids.add(card.id)  # Track by card ID too
+            logger.info(f"select_card: Marked card {card.name} (ID: {card.id}) at position {position} as used for player 1")
         else:
+            card = self.player2_team[position]
+            # Double-check it's not already used
+            if position in self.player2_used_cards or card.id in self.player2_used_card_ids:
+                logger.error(f"select_card: Card {card.name} (ID: {card.id}) at position {position} is already used for player 2!")
+                return False
             self.player2_used_cards.add(position)
+            self.player2_used_card_ids.add(card.id)  # Track by card ID too
+            logger.info(f"select_card: Marked card {card.name} (ID: {card.id}) at position {position} as used for player 2")
         
         return True
     
     def play_round(self, player1_position: str, player2_position: str) -> Dict:
         """Play a round and update scores"""
-        # Get cards
+        import logging
+        logger = logging.getLogger('discord_bot')
+        
+        # Get cards - IMPORTANT: Get fresh references each time
         player1_card = self.player1_team[player1_position]
         player2_card = self.player2_team[player2_position]
         
+        # Log which cards are being used THIS round
+        logger.info(f"Round {self.current_round}: Player 1 using {player1_card.name} (ID: {player1_card.id}) at {player1_position}")
+        logger.info(f"Round {self.current_round}: Player 2 using {player2_card.name} (ID: {player2_card.id}) at {player2_position}")
+        
         # Alternate who attacks (odd rounds: player1 attacks, even rounds: player2 attacks)
+        attacking_player = 1 if self.current_round % 2 == 1 else 2
+        winner_this_round = None
+        
         if self.current_round % 2 == 1:
+            # Odd round: Player 1 attacks, Player 2 defends
             result, details = MatchEngine.simulate_round(
                 player1_card, player1_position, self.player1_formation, self.player1_team,
                 player2_card, player2_position, self.player2_formation, self.player2_team
             )
             
+            # CRITICAL: Log the actual result to verify score tracking
+            logger.info(f"Round {self.current_round} (P1 attacks): Result={result}")
+            logger.info(f"  P1 Card: {details['attacker']['card']}, Attack Roll: {details['attacker']['roll']}")
+            logger.info(f"  P2 Card: {details['defender']['card']}, Defense Roll: {details['defender']['roll']}")
+            
             if result == 'attacker_wins':
                 self.player1_score += 1
+                winner_this_round = self.player1_id
+                logger.info(f"  Player 1 wins! Score: {self.player1_score} - {self.player2_score}")
             elif result == 'defender_wins':
                 self.player2_score += 1
+                winner_this_round = self.player2_id
+                logger.info(f"  Player 2 wins! Score: {self.player1_score} - {self.player2_score}")
+            else:
+                winner_this_round = None
+                logger.info(f"  Draw! Score: {self.player1_score} - {self.player2_score}")
         else:
+            # Even round: Player 2 attacks, Player 1 defends
             result, details = MatchEngine.simulate_round(
                 player2_card, player2_position, self.player2_formation, self.player2_team,
                 player1_card, player1_position, self.player1_formation, self.player1_team
             )
             
+            # CRITICAL: Log the actual result
+            logger.info(f"Round {self.current_round} (P2 attacks): Result={result}")
+            logger.info(f"  P2 Card: {details['attacker']['card']}, Attack Roll: {details['attacker']['roll']}")
+            logger.info(f"  P1 Card: {details['defender']['card']}, Defense Roll: {details['defender']['roll']}")
+            
             if result == 'attacker_wins':
                 self.player2_score += 1
+                winner_this_round = self.player2_id
+                logger.info(f"  Player 2 wins! Score: {self.player1_score} - {self.player2_score}")
             elif result == 'defender_wins':
                 self.player1_score += 1
+                winner_this_round = self.player1_id
+                logger.info(f"  Player 1 wins! Score: {self.player1_score} - {self.player2_score}")
+            else:
+                winner_this_round = None
+                logger.info(f"  Draw! Score: {self.player1_score} - {self.player2_score}")
         
-        # Store round result
+        # Track round winner
+        self.round_winners.append(winner_this_round)
+        logger.info(f"Round {self.current_round} winner ID: {winner_this_round}")
+        
+        # Store round result with FRESH card names/data
+        # Always use player1_card and player2_card directly, not from details
         round_data = {
             'round': self.current_round,
-            'player1_card': player1_card.name,
+            'player1_card': player1_card.name,  # Always use player1's actual card
             'player1_position': player1_position,
-            'player2_card': player2_card.name,
+            'player1_card_id': player1_card.id,  # Add ID for verification
+            'player2_card': player2_card.name,  # Always use player2's actual card
             'player2_position': player2_position,
+            'player2_card_id': player2_card.id,  # Add ID for verification
             'details': details,
-            'score': f"{self.player1_score} - {self.player2_score}"
+            'score': f"{self.player1_score} - {self.player2_score}",
+            'attacking_player': attacking_player,  # Track who attacked this round
+            'winner_id': winner_this_round  # Track winner for verification
         }
         
         self.round_history.append(round_data)
+        
+        # Log the complete round data for debugging
+        logger.info(f"Round {self.current_round} complete. Stored: P1={player1_card.name} (ID: {player1_card.id}), P2={player2_card.name} (ID: {player2_card.id})")
         
         # Switch turn
         self.current_turn = self.player2_id if self.current_turn == self.player1_id else self.player1_id
