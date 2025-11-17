@@ -38,9 +38,11 @@ class TeamCog(commands.Cog):
                     session.add(user)
                     await session.flush()
                 
-                # Check if team already exists
+                # Check if team already exists FOR THIS GUILD
                 result = await session.execute(
-                    select(Team).where(Team.user_id == interaction.user.id)
+                    select(Team)
+                    .where(Team.user_id == interaction.user.id)
+                    .where(Team.guild_id == interaction.guild.id)
                 )
                 existing_team = result.scalar_one_or_none()
                 
@@ -51,13 +53,13 @@ class TeamCog(commands.Cog):
                     )
                     return
             
-            # Create new team
-            new_team = Team(
-                user_id=interaction.user.id,
-                guild_id=interaction.guild.id
-            )
-            session.add(new_team)
-            await session.commit()
+                # Create new team (INSIDE the with block)
+                new_team = Team(
+                    user_id=interaction.user.id,
+                    guild_id=interaction.guild.id
+                )
+                session.add(new_team)
+                await session.commit()
             
             embed = discord.Embed(
                 title="⚽ Team Created!",
@@ -84,7 +86,9 @@ class TeamCog(commands.Cog):
         try:
             async with AsyncSessionLocal() as session:
                 result = await session.execute(
-                    select(Team).where(Team.user_id == interaction.user.id)
+                    select(Team)
+                    .where(Team.user_id == interaction.user.id)
+                    .where(Team.guild_id == interaction.guild.id)
                 )
                 team = result.scalar_one_or_none()
                 
@@ -231,9 +235,11 @@ class TeamCog(commands.Cog):
         
         try:
             async with AsyncSessionLocal() as session:
-                # Get team
+                # Get team WITH GUILD ISOLATION
                 result = await session.execute(
-                    select(Team).where(Team.user_id == interaction.user.id)
+                    select(Team)
+                    .where(Team.user_id == interaction.user.id)
+                    .where(Team.guild_id == interaction.guild.id)
                 )
                 team = result.scalar_one_or_none()
                 
@@ -274,16 +280,17 @@ class TeamCog(commands.Cog):
                         )
                         return
                     
-                    # Find card in user's collection
+                    # Find ALL matching cards in user's collection
                     result = await session.execute(
                         select(Card, Collection)
                         .join(Collection, Card.id == Collection.card_id)
                         .where(Collection.user_id == interaction.user.id)
                         .where(Card.name.ilike(f"%{player_name}%"))
+                        .order_by(Card.overall_rating.desc())
                     )
-                    card_data = result.first()
+                    cards_data = result.all()
                     
-                    if not card_data:
+                    if not cards_data:
                         await interaction.followup.send(
                             f"❌ You don't have a card matching '{player_name}' in your collection!\n"
                             f"Use `/collection` to see your available cards.",
@@ -291,7 +298,63 @@ class TeamCog(commands.Cog):
                         )
                         return
                     
-                    card, _ = card_data
+                    # Use the best match (exact > starts with > contains)
+                    card = None
+                    player_name_lower = player_name.lower()
+                    for card_obj, _ in cards_data:
+                        if card_obj.name.lower() == player_name_lower:
+                            card = card_obj
+                            break
+                    if not card:
+                        for card_obj, _ in cards_data:
+                            if card_obj.name.lower().startswith(player_name_lower):
+                                card = card_obj
+                                break
+                    if not card:
+                        card = cards_data[0][0]  # Fallback to first match
+                    
+                    # VALIDATE CARD POSITION MATCHES FORMATION SLOT
+                    card_position = card.position.upper()
+                    # Allow flexible position matching (e.g., ST can play CF, CB can play LCB/RCB)
+                    position_compatibility = {
+                        'GK': ['GK'],
+                        'LB': ['LB', 'LWB'], 'RB': ['RB', 'RWB'],
+                        'LWB': ['LWB', 'LB'], 'RWB': ['RWB', 'RB'],
+                        'CB': ['CB', 'LCB', 'RCB'], 'LCB': ['LCB', 'CB'], 'RCB': ['RCB', 'CB'],
+                        'CDM': ['CDM', 'LDM', 'RDM', 'CM'], 'LDM': ['LDM', 'CDM'], 'RDM': ['RDM', 'CDM'],
+                        'CM': ['CM', 'LCM', 'RCM', 'CDM', 'CAM'], 'LCM': ['LCM', 'CM'], 'RCM': ['RCM', 'CM'],
+                        'CAM': ['CAM', 'LAM', 'RAM', 'CM'], 'LAM': ['LAM', 'CAM'], 'RAM': ['RAM', 'CAM'],
+                        'LM': ['LM', 'LW'], 'RM': ['RM', 'RW'],
+                        'LW': ['LW', 'LM', 'ST'], 'RW': ['RW', 'RM', 'ST'],
+                        'ST': ['ST', 'CF', 'LW', 'RW'], 'CF': ['CF', 'ST']
+                    }
+                    
+                    compatible_positions = position_compatibility.get(position, [position])
+                    if card_position not in compatible_positions:
+                        await interaction.followup.send(
+                            f"❌ **{card.name}** is a **{card_position}** and cannot play at **{position}**!\n"
+                            f"This position requires: {', '.join(compatible_positions)}",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    # CHECK IF CARD IS ALREADY USED IN ANOTHER SLOT
+                    result = await session.execute(
+                        select(TeamSlot)
+                        .where(TeamSlot.team_id == team.id)
+                        .where(TeamSlot.card_id == card.id)
+                    )
+                    existing_usage = result.scalar_one_or_none()
+                    
+                    if existing_usage and existing_usage.position != position:
+                        await interaction.followup.send(
+                            f"❌ **{card.name}** is already in your team at position **{existing_usage.position}**!\n"
+                            f"Remove it from there first, or use `/player swap` instead.",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    card_data = (card, None)
                     
                     # Check if position is already occupied
                     result = await session.execute(
@@ -313,30 +376,14 @@ class TeamCog(commands.Cog):
                         )
                         session.add(new_slot)
                     
+                    await session.commit()
+                    
                     embed = discord.Embed(
                         title="✅ Player Added!",
                         description=f"**{card.name}** has been added to position **{position}**",
                         color=discord.Color.green()
                     )
-                    
-                    # Send interaction response - if this fails, we won't commit
-                    try:
-                        await interaction.followup.send(embed=embed)
-                        # Only commit if interaction response succeeds
-                        await session.commit()
-                    except Exception as send_error:
-                        # Rollback if interaction fails
-                        await session.rollback()
-                        logger.error(f"Failed to send player add response, rolled back transaction: {send_error}")
-                        # Try to send error message (might also fail, but worth trying)
-                        try:
-                            await interaction.followup.send(
-                                "❌ Player added but failed to display. Please check your team.",
-                                ephemeral=True
-                            )
-                        except:
-                            pass
-                        raise
+                    await interaction.followup.send(embed=embed)
                 
                 elif action == "remove":
                     # Remove player from position
@@ -355,31 +402,14 @@ class TeamCog(commands.Cog):
                         return
                     
                     await session.delete(slot)
+                    await session.commit()
                     
                     embed = discord.Embed(
                         title="✅ Player Removed!",
                         description=f"Player has been removed from position **{position}**",
                         color=discord.Color.green()
                     )
-                    
-                    # Send interaction response - if this fails, we won't commit
-                    try:
-                        await interaction.followup.send(embed=embed)
-                        # Only commit if interaction response succeeds
-                        await session.commit()
-                    except Exception as send_error:
-                        # Rollback if interaction fails
-                        await session.rollback()
-                        logger.error(f"Failed to send player remove response, rolled back transaction: {send_error}")
-                        # Try to send error message (might also fail, but worth trying)
-                        try:
-                            await interaction.followup.send(
-                                "❌ Player removed but failed to display. Please check your team.",
-                                ephemeral=True
-                            )
-                        except:
-                            pass
-                        raise
+                    await interaction.followup.send(embed=embed)
                 
                 elif action == "swap":
                     if not position2:
@@ -419,31 +449,14 @@ class TeamCog(commands.Cog):
                     
                     # Swap card IDs
                     slot1.card_id, slot2.card_id = slot2.card_id, slot1.card_id
+                    await session.commit()
                     
                     embed = discord.Embed(
                         title="✅ Players Swapped!",
                         description=f"Players at positions **{position}** and **{position2}** have been swapped",
                         color=discord.Color.green()
                     )
-                    
-                    # Send interaction response - if this fails, we won't commit
-                    try:
-                        await interaction.followup.send(embed=embed)
-                        # Only commit if interaction response succeeds
-                        await session.commit()
-                    except Exception as send_error:
-                        # Rollback if interaction fails
-                        await session.rollback()
-                        logger.error(f"Failed to send player swap response, rolled back transaction: {send_error}")
-                        # Try to send error message (might also fail, but worth trying)
-                        try:
-                            await interaction.followup.send(
-                                "❌ Players swapped but failed to display. Please check your team.",
-                                ephemeral=True
-                            )
-                        except:
-                            pass
-                        raise
+                    await interaction.followup.send(embed=embed)
         except Exception as e:
             logger.error(f"Error in player_manage: {e}", exc_info=True)
             await interaction.followup.send(
@@ -528,9 +541,11 @@ class TeamCog(commands.Cog):
         
         try:
             async with AsyncSessionLocal() as session:
-                # Get user's team to check formation
+                # Get user's team to check formation WITH GUILD ISOLATION
                 result = await session.execute(
-                    select(Team).where(Team.user_id == interaction.user.id)
+                    select(Team)
+                    .where(Team.user_id == interaction.user.id)
+                    .where(Team.guild_id == interaction.guild.id)
                 )
                 team = result.scalar_one_or_none()
                 
@@ -609,11 +624,12 @@ class TeamCog(commands.Cog):
         
         try:
             async with AsyncSessionLocal() as session:
-                # Load team with logo relationship
+                # Load team with logo relationship WITH GUILD ISOLATION
                 result = await session.execute(
                     select(Team)
                     .options(selectinload(Team.logo))
                     .where(Team.user_id == interaction.user.id)
+                    .where(Team.guild_id == interaction.guild.id)
                 )
                 team = result.scalar_one_or_none()
                 
@@ -635,7 +651,7 @@ class TeamCog(commands.Cog):
                         embed = discord.Embed(
                             title="🛡️ Your Team Logo",
                             description="You don't have a logo yet!",
-                            color=discord.Color.grey()
+                            color=discord.Color.greyple()
                         )
                     
                     await interaction.followup.send(embed=embed)
@@ -648,45 +664,45 @@ class TeamCog(commands.Cog):
                         )
                         return
                     
-                    # Find logo
+                    # Find ALL matching logos
                     result = await session.execute(
-                        select(Logo).where(Logo.name.ilike(f"%{logo_name}%"))
+                        select(Logo)
+                        .where(Logo.name.ilike(f"%{logo_name}%"))
+                        .order_by(Logo.bonus.desc())
                     )
-                    logo = result.scalar_one_or_none()
+                    logos = result.scalars().all()
                     
-                    if not logo:
+                    if not logos:
                         await interaction.followup.send(
-                            f"Logo '{logo_name}' not found!",
+                            f"❌ No logos matching '{logo_name}' found!",
                             ephemeral=True
                         )
                         return
                     
+                    # Use best match (exact > starts with > contains)
+                    logo = None
+                    logo_name_lower = logo_name.lower()
+                    for logo_obj in logos:
+                        if logo_obj.name.lower() == logo_name_lower:
+                            logo = logo_obj
+                            break
+                    if not logo:
+                        for logo_obj in logos:
+                            if logo_obj.name.lower().startswith(logo_name_lower):
+                                logo = logo_obj
+                                break
+                    if not logo:
+                        logo = logos[0]  # Fallback to first match
+                    
                     team.logo_id = logo.id
+                    await session.commit()
                     
                     embed = discord.Embed(
                         title="✅ Logo Added!",
                         description=f"**{logo.name}** has been added to your team!\n+{logo.bonus} OVR Bonus",
                         color=discord.Color.green()
                     )
-                    
-                    # Send interaction response - if this fails, we won't commit
-                    try:
-                        await interaction.followup.send(embed=embed)
-                        # Only commit if interaction response succeeds
-                        await session.commit()
-                    except Exception as send_error:
-                        # Rollback if interaction fails
-                        await session.rollback()
-                        logger.error(f"Failed to send logo add response, rolled back transaction: {send_error}")
-                        # Try to send error message (might also fail, but worth trying)
-                        try:
-                            await interaction.followup.send(
-                                "❌ Logo added but failed to display. Please check your team.",
-                                ephemeral=True
-                            )
-                        except:
-                            pass
-                        raise
+                    await interaction.followup.send(embed=embed)
                 
                 elif action == "remove":
                     if not team.logo:
@@ -697,31 +713,14 @@ class TeamCog(commands.Cog):
                         return
                     
                     team.logo_id = None
+                    await session.commit()
                     
                     embed = discord.Embed(
                         title="✅ Logo Removed!",
                         description="Your team logo has been removed",
                         color=discord.Color.green()
                     )
-                    
-                    # Send interaction response - if this fails, we won't commit
-                    try:
-                        await interaction.followup.send(embed=embed)
-                        # Only commit if interaction response succeeds
-                        await session.commit()
-                    except Exception as send_error:
-                        # Rollback if interaction fails
-                        await session.rollback()
-                        logger.error(f"Failed to send logo remove response, rolled back transaction: {send_error}")
-                        # Try to send error message (might also fail, but worth trying)
-                        try:
-                            await interaction.followup.send(
-                                "❌ Logo removed but failed to display. Please check your team.",
-                                ephemeral=True
-                            )
-                        except:
-                            pass
-                        raise
+                    await interaction.followup.send(embed=embed)
         except Exception as e:
             logger.error(f"Error in logo_manage: {e}", exc_info=True)
             await interaction.followup.send(

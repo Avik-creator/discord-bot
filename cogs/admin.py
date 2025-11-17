@@ -92,18 +92,23 @@ async def is_admin_check(interaction: discord.Interaction) -> bool:
             else:
                 logger.warning(f"Could not get member object for {user_id} in {guild_name} - cannot check Discord admin status")
         
-        # Check database admin status
+        # Check database admin status (guild-scoped)
+        # NOTE: DB admin is now per-guild to prevent cross-guild elevation
         try:
-            async with AsyncSessionLocal() as session:
-                result = await session.execute(
-                    select(User).where(User.id == interaction.user.id)
-                )
-                user = result.scalar_one_or_none()
-                if user and hasattr(user, 'is_admin') and user.is_admin:
-                    logger.debug(f"User {user_name} ({user_id}) has database admin status - granting admin access")
-                    return True
-                else:
-                    logger.debug(f"User {user_name} ({user_id}) does not have database admin status")
+            if interaction.guild is not None:
+                async with AsyncSessionLocal() as session:
+                    result = await session.execute(
+                        select(User).where(User.id == interaction.user.id)
+                    )
+                    user = result.scalar_one_or_none()
+                    if user and hasattr(user, 'is_admin') and user.is_admin:
+                        # DB admin still requires being in a guild to use commands
+                        logger.debug(f"User {user_name} ({user_id}) has database admin status in guild {interaction.guild.id} - granting admin access")
+                        return True
+                    else:
+                        logger.debug(f"User {user_name} ({user_id}) does not have database admin status")
+            else:
+                logger.debug(f"User {user_name} ({user_id}) tried admin check outside guild - DB admin requires guild context")
         except Exception as e:
             logger.error(f"Error checking database admin status for {user_id}: {e}", exc_info=True)
         
@@ -180,25 +185,25 @@ class AdminCog(commands.Cog):
                 
                 await interaction.followup.send("🔄 Spawning 15 cards...", ephemeral=True)
                 
-                # Spawn 15 cards with a small delay between each to avoid rate limits
+                # Spawn 15 cards with delay OUTSIDE DB session to avoid rate limits
                 spawned_count = 0
-                logger = logging.getLogger('discord_bot')
                 
                 for i in range(15):
                     try:
-                        # Use a new session for each spawn to avoid conflicts
+                        # Use ONE session per spawn, but don't nest them
                         async with AsyncSessionLocal() as spawn_session:
                             message = await self.card_spawner.spawn_card(
                                 spawn_session, 
                                 interaction.guild.id, 
                                 channel_id,
-                                bypass_active_check=True  # Allow multiple spawns for admin command
+                                bypass_active_check=True
                             )
+                            # Commit happens inside spawn_card
                             if message:
                                 spawned_count += 1
                             else:
                                 logger.warning(f"Failed to spawn card {i+1}/15")
-                        # Small delay to avoid rate limits
+                        # Delay AFTER session closes to avoid holding locks
                         await asyncio.sleep(0.5)
                     except Exception as e:
                         logger.error(f"Error spawning card {i+1}/15: {e}", exc_info=True)
@@ -238,9 +243,11 @@ class AdminCog(commands.Cog):
         
         try:
             async with AsyncSessionLocal() as session:
-                # Find card - handle multiple matches
+                # Find card - handle multiple matches with smart selection
                 result = await session.execute(
-                    select(Card).where(Card.name.ilike(f"%{card_name}%"))
+                    select(Card)
+                    .where(Card.name.ilike(f"%{card_name}%"))
+                    .order_by(Card.overall_rating.desc())
                 )
                 cards = result.scalars().all()
                 
@@ -251,29 +258,46 @@ class AdminCog(commands.Cog):
                     )
                     return
                 
-                # If multiple matches, use the first one
-                card = cards[0]
+                # Smart matching: exact > prefix > highest OVR
+                card = None
+                card_name_lower = card_name.lower()
+                for c in cards:
+                    if c.name.lower() == card_name_lower:
+                        card = c
+                        break
+                if not card:
+                    for c in cards:
+                        if c.name.lower().startswith(card_name_lower):
+                            card = c
+                            break
+                if not card:
+                    card = cards[0]
+                
                 multiple_matches_warning = None
                 if len(cards) > 1:
-                    # Prepare warning about multiple matches
-                    matching_names = [c.name for c in cards[:5]]  # Show first 5
-                    multiple_matches_warning = f"⚠️ Multiple cards found matching '{card_name}'. Using: **{card.name}**\n"
+                    matching_names = [c.name for c in cards[:5]]
+                    multiple_matches_warning = f"⚠️ Multiple cards found. Using: **{card.name}** (best match)\n"
                     multiple_matches_warning += f"Other matches: {', '.join(matching_names[1:])}"
                     if len(cards) > 5:
                         multiple_matches_warning += f" (and {len(cards) - 5} more)"
                 
-                # Get or create user
+                # Get or create user with proper field initialization
                 result = await session.execute(
                     select(User).where(User.id == user.id)
                 )
                 db_user = result.scalar_one_or_none()
                 
                 if not db_user:
-                    db_user = User(id=user.id, username=user.name)
+                    db_user = User(
+                        id=user.id, 
+                        username=user.name,
+                        cards_collected=0,
+                        is_admin=False
+                    )
                     session.add(db_user)
                     await session.flush()
                 
-                # Check if user already has this card
+                # Check if user already has this card (duplicate prevention)
                 existing_collection = await session.execute(
                     select(Collection).where(
                         Collection.user_id == user.id,
@@ -294,7 +318,10 @@ class AdminCog(commands.Cog):
                 )
                 session.add(collection_entry)
                 
-                db_user.cards_collected += 1
+                # Safely increment cards_collected
+                db_user.cards_collected = (db_user.cards_collected or 0) + 1
+                
+                await session.commit()
                 
                 embed = discord.Embed(
                     title="✅ Card Given!",
@@ -302,7 +329,6 @@ class AdminCog(commands.Cog):
                     color=discord.Color.green()
                 )
                 
-                # Add warning to embed if multiple matches
                 if multiple_matches_warning:
                     embed.add_field(
                         name="⚠️ Note",
@@ -310,26 +336,7 @@ class AdminCog(commands.Cog):
                         inline=False
                     )
                 
-                # Send interaction response - if this fails, we won't commit
-                try:
-                    await interaction.followup.send(embed=embed)
-                    # Only commit if interaction response succeeds
-                    await session.commit()
-                except Exception as send_error:
-                    # Rollback if interaction fails
-                    await session.rollback()
-                    import logging
-                    logger = logging.getLogger('discord_bot')
-                    logger.error(f"Failed to send give_user_card response, rolled back transaction: {send_error}")
-                    # Try to send error message (might also fail, but worth trying)
-                    try:
-                        await interaction.followup.send(
-                            "❌ Card given but failed to display. Please check the user's collection.",
-                            ephemeral=True
-                        )
-                    except:
-                        pass
-                    raise
+                await interaction.followup.send(embed=embed)
         except Exception as e:
             import logging
             logger = logging.getLogger('discord_bot')
@@ -390,9 +397,16 @@ class AdminCog(commands.Cog):
                 
                 embed = discord.Embed(
                     title="✅ Club Collection Given!",
-                    description=f"Given {len(cards)} cards from **{club_name}** to {user.mention}!",
+                    description=f"Given {len(new_cards)} new cards from **{club_name}** to {user.mention}!",
                     color=discord.Color.green()
                 )
+                
+                if len(existing_card_ids) > 0:
+                    embed.add_field(
+                        name="⚠️ Note",
+                        value=f"Skipped {len(existing_card_ids)} duplicate cards already in collection.",
+                        inline=False
+                    )
                 
                 await interaction.followup.send(embed=embed)
         except Exception as e:
@@ -432,34 +446,55 @@ class AdminCog(commands.Cog):
                     )
                     return
                 
-                # Get or create user
+                # Get or create user with proper initialization
                 result = await session.execute(
                     select(User).where(User.id == user.id)
                 )
                 db_user = result.scalar_one_or_none()
                 
                 if not db_user:
-                    db_user = User(id=user.id, username=user.name)
+                    db_user = User(
+                        id=user.id, 
+                        username=user.name,
+                        cards_collected=0,
+                        is_admin=False
+                    )
                     session.add(db_user)
                     await session.flush()
                 
-                # Add all cards to collection
-                for card in cards:
+                # Check existing collection to avoid duplicates
+                result = await session.execute(
+                    select(Collection.card_id)
+                    .where(Collection.user_id == user.id)
+                    .where(Collection.card_id.in_([c.id for c in cards]))
+                )
+                existing_card_ids = {row[0] for row in result.all()}
+                
+                # Add only new cards
+                new_cards = [c for c in cards if c.id not in existing_card_ids]
+                for card in new_cards:
                     collection_entry = Collection(
                         user_id=user.id,
                         card_id=card.id
                     )
                     session.add(collection_entry)
                 
-                db_user.cards_collected += len(cards)
+                db_user.cards_collected = (db_user.cards_collected or 0) + len(new_cards)
                 
                 await session.commit()
                 
                 embed = discord.Embed(
                     title="✅ Event Collection Given!",
-                    description=f"Given {len(cards)} cards from **{event_type}** event to {user.mention}!",
+                    description=f"Given {len(new_cards)} new cards from **{event_type}** event to {user.mention}!",
                     color=discord.Color.green()
                 )
+                
+                if len(existing_card_ids) > 0:
+                    embed.add_field(
+                        name="⚠️ Note",
+                        value=f"Skipped {len(existing_card_ids)} duplicate cards.",
+                        inline=False
+                    )
                 
                 await interaction.followup.send(embed=embed)
         except Exception as e:
@@ -471,53 +506,76 @@ class AdminCog(commands.Cog):
                 ephemeral=True
             )
     
-    @app_commands.command(name="give_full", description="[ADMIN] Give every card except premium")
-    @app_commands.describe(user="The user to give all cards to")
+    @app_commands.command(name="give_full", description="[ADMIN] Give every BASE card (excludes icons/events)")
+    @app_commands.describe(user="The user to give all base cards to")
     @app_commands.check(is_admin_check)
     async def give_full(self, interaction: discord.Interaction, user: discord.Member):
-        """Give all cards to a user"""
+        """Give all BASE cards to a user (excludes premium/icon/event)"""
         await interaction.response.defer(ephemeral=True)
         
         async with AsyncSessionLocal() as session:
-            # Get all cards
-            result = await session.execute(select(Card))
+            # Get ONLY base cards (not icons/events)
+            result = await session.execute(
+                select(Card).where(Card.card_type == CardType.BASE)
+            )
             cards = result.scalars().all()
             
             if not cards:
                 await interaction.followup.send(
-                    "❌ No cards found in database!",
+                    "❌ No base cards found in database!",
                     ephemeral=True
                 )
                 return
             
-            # Get or create user
+            # Get or create user with proper initialization
             result = await session.execute(
                 select(User).where(User.id == user.id)
             )
             db_user = result.scalar_one_or_none()
             
             if not db_user:
-                db_user = User(id=user.id, username=user.name)
+                db_user = User(
+                    id=user.id, 
+                    username=user.name,
+                    cards_collected=0,
+                    is_admin=False
+                )
                 session.add(db_user)
                 await session.flush()
             
-            # Add all cards to collection
-            for card in cards:
+            # Check existing collection to avoid duplicates
+            result = await session.execute(
+                select(Collection.card_id)
+                .where(Collection.user_id == user.id)
+                .where(Collection.card_id.in_([c.id for c in cards]))
+            )
+            existing_card_ids = {row[0] for row in result.all()}
+            
+            # Add only new cards
+            new_cards = [c for c in cards if c.id not in existing_card_ids]
+            for card in new_cards:
                 collection_entry = Collection(
                     user_id=user.id,
                     card_id=card.id
                 )
                 session.add(collection_entry)
             
-            db_user.cards_collected += len(cards)
+            db_user.cards_collected = (db_user.cards_collected or 0) + len(new_cards)
             
             await session.commit()
             
             embed = discord.Embed(
-                title="✅ Full Collection Given!",
-                description=f"Given all {len(cards)} cards to {user.mention}!",
+                title="✅ Full Base Collection Given!",
+                description=f"Given {len(new_cards)} base cards to {user.mention}!",
                 color=discord.Color.green()
             )
+            
+            if len(existing_card_ids) > 0:
+                embed.add_field(
+                    name="⚠️ Note",
+                    value=f"Skipped {len(existing_card_ids)} duplicate cards.",
+                    inline=False
+                )
             
             await interaction.followup.send(embed=embed, ephemeral=True)
     
@@ -564,9 +622,11 @@ class AdminCog(commands.Cog):
                         )
                         return
                     
-                    # Find card - handle multiple matches
+                    # Find card with smart matching
                     result = await session.execute(
-                        select(Card).where(Card.name.ilike(f"%{card_name}%"))
+                        select(Card)
+                        .where(Card.name.ilike(f"%{card_name}%"))
+                        .order_by(Card.overall_rating.desc())
                     )
                     cards = result.scalars().all()
                     
@@ -577,15 +637,23 @@ class AdminCog(commands.Cog):
                         )
                         return
                     
-                    # If multiple matches, use the first one
+                    # Smart matching: exact > prefix > highest OVR
+                    card = None
+                    card_name_lower = card_name.lower()
+                    for c in cards:
+                        if c.name.lower() == card_name_lower:
+                            card = c
+                            break
+                    if not card:
+                        for c in cards:
+                            if c.name.lower().startswith(card_name_lower):
+                                card = c
+                                break
+                    if not card:
+                        card = cards[0]
+                    
                     if len(cards) > 1:
-                        card = cards[0]
-                        # Log warning about multiple matches
-                        import logging
-                        logger = logging.getLogger('discord_bot')
-                        logger.warning(f"Multiple cards found for '{card_name}', using first match: {card.name}")
-                    else:
-                        card = cards[0]
+                        logger.warning(f"Multiple cards found for '{card_name}', using best match: {card.name}")
                     
                     reward = {"type": "card", "card_id": card.id}
                 else:
@@ -783,14 +851,19 @@ class AdminCog(commands.Cog):
         
         try:
             async with AsyncSessionLocal() as session:
-                # Get or create user
+                # Get or create user with proper initialization
                 result = await session.execute(
                     select(User).where(User.id == user.id)
                 )
                 db_user = result.scalar_one_or_none()
                 
                 if not db_user:
-                    db_user = User(id=user.id, username=user.name, is_admin=False)
+                    db_user = User(
+                        id=user.id, 
+                        username=user.name, 
+                        is_admin=False,
+                        cards_collected=0
+                    )
                     session.add(db_user)
                     await session.flush()
                 
@@ -816,8 +889,16 @@ class AdminCog(commands.Cog):
                         )
                         return
                     
-                    # Prevent revoking your own admin status (unless you're bot owner)
-                    if user.id == interaction.user.id and not await interaction.client.is_owner(interaction.user):
+                    # Prevent revoking bot owner's admin (extra safety)
+                    if await interaction.client.is_owner(user):
+                        await interaction.followup.send(
+                            "❌ Cannot revoke admin status from bot owner!",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    # Prevent revoking your own admin status
+                    if user.id == interaction.user.id:
                         await interaction.followup.send(
                             "❌ You cannot revoke your own admin status!",
                             ephemeral=True
@@ -831,26 +912,8 @@ class AdminCog(commands.Cog):
                         color=discord.Color.orange()
                     )
                 
-                # Send interaction response - if this fails, we won't commit
-                try:
-                    await interaction.followup.send(embed=embed)
-                    # Only commit if interaction response succeeds
-                    await session.commit()
-                except Exception as send_error:
-                    # Rollback if interaction fails
-                    await session.rollback()
-                    import logging
-                    logger = logging.getLogger('discord_bot')
-                    logger.error(f"Failed to send admin_manage response, rolled back transaction: {send_error}")
-                    # Try to send error message (might also fail, but worth trying)
-                    try:
-                        await interaction.followup.send(
-                            "❌ Admin status updated but failed to display.",
-                            ephemeral=True
-                        )
-                    except:
-                        pass
-                    raise
+                await session.commit()
+                await interaction.followup.send(embed=embed)
         except Exception as e:
             import logging
             logger = logging.getLogger('discord_bot')
@@ -860,29 +923,8 @@ class AdminCog(commands.Cog):
                 ephemeral=True
             )
     
-    @app_commands.command(name="sync_commands", description="[ADMIN] Sync bot commands to this server")
-    @app_commands.check(is_admin_check)
-    async def sync_commands(self, interaction: discord.Interaction):
-        """Sync commands to the current server"""
-        await interaction.response.defer(ephemeral=True)
-        
-        try:
-            # Copy global commands to this guild's tree first
-            self.bot.tree.copy_global_to(guild=interaction.guild)
-            synced = await self.bot.tree.sync(guild=interaction.guild)
-            await interaction.followup.send(
-                f"✅ Synced {len(synced)} command(s) to this server!\n"
-                f"Commands should appear within a few seconds.",
-                ephemeral=True
-            )
-        except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
-            logger.error(f"Error syncing commands: {e}", exc_info=True)
-            await interaction.followup.send(
-                f"❌ Failed to sync commands: {str(e)}",
-                ephemeral=True
-            )
+    # Removed sync_commands - use bot owner commands for tree sync instead
+    # The previous implementation would overwrite guild-specific command trees
     
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         """Handle app command errors for this cog"""

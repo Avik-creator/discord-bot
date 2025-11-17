@@ -19,6 +19,27 @@ class CollectionCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.api_football = APIFootball()
+        
+        # Validate cooldown config on startup
+        required_cooldowns = ['daily_pack', 'weekly_pack', 'event_pack', 'premium_pack', 'booster_pack', 'vote']
+        for cooldown_type in required_cooldowns:
+            if cooldown_type not in config.COOLDOWNS:
+                logger.warning(f"Missing cooldown config for '{cooldown_type}' - defaulting to 0 seconds")
+                config.COOLDOWNS[cooldown_type] = 0
+    
+    async def _get_or_create_user(self, session: AsyncSession, user_id: int, username: str) -> User:
+        """Get or create user within an active session. Centralized to avoid duplication."""
+        result = await session.execute(
+            select(User).where(User.id == user_id)
+        )
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            user = User(id=user_id, username=username)
+            session.add(user)
+            await session.flush()
+        
+        return user
     
     def _format_time(self, seconds: int) -> str:
         """Format seconds into a human-readable time string (e.g., '23h 45m 30s' or '6d 12h 30m')"""
@@ -64,10 +85,12 @@ class CollectionCog(commands.Cog):
         else:
             return False, int(cooldown_duration - time_passed)
     
-    async def _give_random_card(self, session: AsyncSession, user_id: int, 
+    async def _give_random_card(self, session: AsyncSession, user: User, 
                                card_type: CardType = None) -> Card:
-        """Give a random card to user (does NOT commit - caller must commit)"""
-        # Get random card
+        """Give a random card to user (does NOT commit - caller must commit).
+        Assumes user is attached to the provided session.
+        """
+        # Get random card - handle None card_type meaning "any type"
         card = await self.api_football.get_random_card_from_db(session, card_type)
         
         if not card:
@@ -75,18 +98,13 @@ class CollectionCog(commands.Cog):
         
         # Add to collection
         collection_entry = Collection(
-            user_id=user_id,
+            user_id=user.id,
             card_id=card.id
         )
         session.add(collection_entry)
         
-        # Update user stats
-        result = await session.execute(
-            select(User).where(User.id == user_id)
-        )
-        user = result.scalar_one_or_none()
-        if user:
-            user.cards_collected += 1
+        # Update user stats (user is already attached to session)
+        user.cards_collected += 1
         
         # DO NOT commit here - let the caller commit after interaction succeeds
         return card
@@ -108,15 +126,7 @@ class CollectionCog(commands.Cog):
         try:
             async with AsyncSessionLocal() as session:
                 # Get or create user
-                result = await session.execute(
-                    select(User).where(User.id == interaction.user.id)
-                )
-                user = result.scalar_one_or_none()
-                
-                if not user:
-                    user = User(id=interaction.user.id, username=interaction.user.name)
-                    session.add(user)
-                    await session.flush()
+                user = await self._get_or_create_user(session, interaction.user.id, interaction.user.name)
                 
                 # Check cooldown
                 can_use, seconds_remaining = await self._check_cooldown(user, pack_type)
@@ -136,23 +146,24 @@ class CollectionCog(commands.Cog):
                     'daily_pack': CardType.BASE,
                     'weekly_pack': CardType.ICON,
                     'event_pack': CardType.EVENT,
-                    'premium_pack': None,  # Random
+                    'premium_pack': None,  # None means random from any type
                     'booster_pack': CardType.BASE,
                 }
                 
                 card_type = card_type_map.get(pack_type)
                 
-                # Give random card
-                card = await self._give_random_card(session, interaction.user.id, card_type)
+                # Give random card (pass user object, not user_id)
+                card = await self._give_random_card(session, user, card_type)
                 
                 if not card:
+                    # Don't apply cooldown on failure
                     await interaction.followup.send(
-                        "❌ Error opening pack. Please try again later.",
+                        "❌ Error opening pack. No cards available. Please try again later.",
                         ephemeral=True
                     )
                     return
                 
-                # Update cooldown
+                # Update cooldown ONLY on success
                 cooldown_field = f"{pack_type}_cooldown"
                 setattr(user, cooldown_field, discord.utils.utcnow())
                 
@@ -161,30 +172,18 @@ class CollectionCog(commands.Cog):
                 embed.title = f"📦 Pack Opened - {card.name}!"
                 embed.color = discord.Color.gold()
                 
-                # Send interaction response - if this fails, we won't commit
-                try:
-                    await interaction.followup.send(embed=embed)
-                    # Only commit if interaction response succeeds
-                    await session.commit()
-                except Exception as send_error:
-                    # Rollback if interaction fails
-                    await session.rollback()
-                    logger.error(f"Failed to send pack response, rolled back transaction: {send_error}")
-                    # Try to send error message (might also fail, but worth trying)
-                    try:
-                        await interaction.followup.send(
-                            "❌ Pack opened but failed to display. Please check your collection.",
-                            ephemeral=True
-                        )
-                    except:
-                        pass
-                    raise
+                # Commit first, then send response
+                await session.commit()
+                await interaction.followup.send(embed=embed)
         except Exception as e:
-            logger.error(f"Error in pack: {e}", exc_info=True)
-            await interaction.followup.send(
-                "❌ An error occurred while opening the pack. Please try again.",
-                ephemeral=True
-            )
+            logger.error(f"Error in open_pack: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(
+                    "❌ An error occurred while opening the pack. Please try again.",
+                    ephemeral=True
+                )
+            except:
+                logger.error("Failed to send error message to user")
     
     @app_commands.command(name="collection", description="View your card collection")
     @app_commands.describe(
@@ -210,56 +209,57 @@ class CollectionCog(commands.Cog):
                 )
                 user = result.scalar_one_or_none()
             
-            if not user:
-                await interaction.followup.send(
-                    "You don't have any cards yet! Use `/pack` or catch spawned cards.",
-                    ephemeral=True
+                if not user:
+                    await interaction.followup.send(
+                        "You don't have any cards yet! Use `/pack` or catch spawned cards.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Get collection
+                query = (
+                    select(Card, Collection)
+                    .join(Collection, Card.id == Collection.card_id)
+                    .where(Collection.user_id == interaction.user.id)
                 )
-                return
-            
-            # Get collection
-            query = (
-                select(Card, Collection)
-                .join(Collection, Card.id == Collection.card_id)
-                .where(Collection.user_id == interaction.user.id)
-            )
-            
-            # Apply event filter
-            if event_filter:
-                query = query.where(Card.event_type == event_filter)
-            
-            # Apply sorting
-            if sort_by == "ovr":
-                query = query.order_by(Card.overall_rating.desc())
-            elif sort_by == "name":
-                query = query.order_by(Card.name)
-            elif sort_by == "date":
-                query = query.order_by(Collection.obtained_at.desc())
-            
-            result = await session.execute(query)
-            card_data = result.all()
-            
-            if not card_data:
-                await interaction.followup.send(
-                    "No cards found with those filters!",
-                    ephemeral=True
-                )
-                return
-            
-            cards = [card for card, _ in card_data]
-            
-            # Pagination
-            cards_per_page = 10
-            total_pages = (len(cards) + cards_per_page - 1) // cards_per_page
-            page = max(1, min(page, total_pages))
-            
-            start_idx = (page - 1) * cards_per_page
-            end_idx = start_idx + cards_per_page
-            page_cards = cards[start_idx:end_idx]
-            
-            embed = EmbedBuilder.collection_embed(user, page_cards, page, total_pages, sort_by)
-            
-            await interaction.followup.send(embed=embed)
+                
+                # Apply event filter (validate it's not garbage)
+                if event_filter:
+                    # Optionally validate event_filter is a valid CardType
+                    query = query.where(Card.event_type == event_filter)
+                
+                # Apply sorting
+                if sort_by == "ovr":
+                    query = query.order_by(Card.overall_rating.desc())
+                elif sort_by == "name":
+                    query = query.order_by(Card.name)
+                elif sort_by == "date":
+                    query = query.order_by(Collection.obtained_at.desc())
+                
+                result = await session.execute(query)
+                card_data = result.all()
+                
+                if not card_data:
+                    await interaction.followup.send(
+                        "No cards found with those filters!",
+                        ephemeral=True
+                    )
+                    return
+                
+                cards = [card for card, _ in card_data]
+                
+                # Pagination
+                cards_per_page = 10
+                total_pages = (len(cards) + cards_per_page - 1) // cards_per_page
+                page = max(1, min(page, total_pages))
+                
+                start_idx = (page - 1) * cards_per_page
+                end_idx = start_idx + cards_per_page
+                page_cards = cards[start_idx:end_idx]
+                
+                embed = EmbedBuilder.collection_embed(user, page_cards, page, total_pages, sort_by)
+                
+                await interaction.followup.send(embed=embed)
         except Exception as e:
             logger.error(f"Error in collection: {e}", exc_info=True)
             await interaction.followup.send(
@@ -275,26 +275,46 @@ class CollectionCog(commands.Cog):
         
         try:
             async with AsyncSessionLocal() as session:
-                # Find card in user's collection
+                # Find ALL matching cards in user's collection
                 result = await session.execute(
                     select(Card, Collection)
                     .join(Collection, Card.id == Collection.card_id)
                     .where(Collection.user_id == interaction.user.id)
                     .where(Card.name.ilike(f"%{player_name}%"))
+                    .order_by(Card.overall_rating.desc())
                 )
-                card_data = result.first()
+                card_data_list = result.all()
             
-            if not card_data:
-                await interaction.followup.send(
-                    f"You don't have a card matching '{player_name}'!",
-                    ephemeral=True
-                )
-                return
-            
-            card, _ = card_data
-            
-            embed = EmbedBuilder.card_embed(card, show_full=True)
-            await interaction.followup.send(embed=embed)
+                if not card_data_list:
+                    await interaction.followup.send(
+                        f"You don't have a card matching '{player_name}'!",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Use smart matching: exact > starts with > contains
+                card = None
+                player_name_lower = player_name.lower()
+                
+                # Try exact match first
+                for card_obj, _ in card_data_list:
+                    if card_obj.name.lower() == player_name_lower:
+                        card = card_obj
+                        break
+                
+                # Try prefix match
+                if not card:
+                    for card_obj, _ in card_data_list:
+                        if card_obj.name.lower().startswith(player_name_lower):
+                            card = card_obj
+                            break
+                
+                # Fallback to first match (highest OVR due to ordering)
+                if not card:
+                    card = card_data_list[0][0]
+                
+                embed = EmbedBuilder.card_embed(card, show_full=True)
+                await interaction.followup.send(embed=embed)
         except Exception as e:
             logger.error(f"Error in compare: {e}", exc_info=True)
             await interaction.followup.send(
@@ -338,15 +358,7 @@ class CollectionCog(commands.Cog):
         try:
             async with AsyncSessionLocal() as session:
                 # Get or create user
-                result = await session.execute(
-                    select(User).where(User.id == interaction.user.id)
-                )
-                user = result.scalar_one_or_none()
-                
-                if not user:
-                    user = User(id=interaction.user.id, username=interaction.user.name)
-                    session.add(user)
-                    await session.flush()
+                user = await self._get_or_create_user(session, interaction.user.id, interaction.user.name)
                 
                 # Check cooldown
                 can_use, seconds_remaining = await self._check_cooldown(user, 'vote')
@@ -359,17 +371,18 @@ class CollectionCog(commands.Cog):
                     )
                     return
                 
-                # Give random base card
-                card = await self._give_random_card(session, interaction.user.id, CardType.BASE)
+                # Give random base card (pass user object)
+                card = await self._give_random_card(session, user, CardType.BASE)
                 
                 if not card:
+                    # Don't apply cooldown on failure
                     await interaction.followup.send(
-                        "❌ Error giving reward. Please try again later.",
+                        "❌ Error giving reward. No cards available.",
                         ephemeral=True
                     )
                     return
                 
-                # Update cooldown
+                # Update cooldown ONLY on success
                 user.vote_cooldown = discord.utils.utcnow()
                 
                 embed = discord.Embed(
@@ -379,30 +392,18 @@ class CollectionCog(commands.Cog):
                 )
                 embed.add_field(name="Vote Link", value="[Vote on top.gg](https://top.gg)", inline=False)
                 
-                # Send interaction response - if this fails, we won't commit
-                try:
-                    await interaction.followup.send(embed=embed)
-                    # Only commit if interaction response succeeds
-                    await session.commit()
-                except Exception as send_error:
-                    # Rollback if interaction fails
-                    await session.rollback()
-                    logger.error(f"Failed to send vote reward response, rolled back transaction: {send_error}")
-                    # Try to send error message (might also fail, but worth trying)
-                    try:
-                        await interaction.followup.send(
-                            "❌ Reward processed but failed to display. Please check your collection.",
-                            ephemeral=True
-                        )
-                    except:
-                        pass
-                    raise
+                # Commit first, then send
+                await session.commit()
+                await interaction.followup.send(embed=embed)
         except Exception as e:
-            logger.error(f"Error in trade: {e}", exc_info=True)
-            await interaction.followup.send(
-                "❌ An error occurred while processing your vote.",
-                ephemeral=True
-            )
+            logger.error(f"Error in vote_reward: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(
+                    "❌ An error occurred while processing your vote.",
+                    ephemeral=True
+                )
+            except:
+                logger.error("Failed to send error message to user")
     
     @app_commands.command(name="promo", description="Redeem a promo code")
     @app_commands.describe(code="The promo code to redeem")
@@ -413,15 +414,7 @@ class CollectionCog(commands.Cog):
         try:
             async with AsyncSessionLocal() as session:
                 # Get or create user
-                result = await session.execute(
-                    select(User).where(User.id == interaction.user.id)
-                )
-                user = result.scalar_one_or_none()
-                
-                if not user:
-                    user = User(id=interaction.user.id, username=interaction.user.name)
-                    session.add(user)
-                    await session.flush()
+                user = await self._get_or_create_user(session, interaction.user.id, interaction.user.name)
                 
                 # Find promo code
                 result = await session.execute(
@@ -436,16 +429,26 @@ class CollectionCog(commands.Cog):
                     )
                     return
                 
+                # Safely handle used_by (could be None, list, or JSON)
+                used_by = promo.used_by if promo.used_by is not None else []
+                if not isinstance(used_by, list):
+                    # Handle case where DB stores as JSON string or weird type
+                    logger.error(f"Promo code used_by is not a list: {type(used_by)}")
+                    used_by = []
+                
                 # Check if user already used this code
-                if interaction.user.id in promo.used_by:
+                if interaction.user.id in used_by:
                     await interaction.followup.send(
                         "❌ You have already used this promo code!",
                         ephemeral=True
                     )
                     return
                 
+                # Safely handle current_uses null
+                current_uses = promo.current_uses if promo.current_uses is not None else 0
+                
                 # Check max uses
-                if promo.max_uses and promo.current_uses >= promo.max_uses:
+                if promo.max_uses and current_uses >= promo.max_uses:
                     await interaction.followup.send(
                         "❌ This promo code has reached its usage limit!",
                         ephemeral=True
@@ -469,7 +472,7 @@ class CollectionCog(commands.Cog):
                     card_id = reward.get('card_id')
                     if card_id:
                         collection_entry = Collection(
-                            user_id=interaction.user.id,
+                            user_id=user.id,
                             card_id=card_id
                         )
                         session.add(collection_entry)
@@ -485,17 +488,16 @@ class CollectionCog(commands.Cog):
                         'event': CardType.EVENT
                     }
                     card = await self._give_random_card(
-                        session, interaction.user.id, 
+                        session, user,
                         card_type_map.get(pack_type, CardType.BASE)
                     )
                     if card:
                         reward_text = f"You received **{card.name}** ({card.overall_rating} OVR)!"
                 
-                # Update promo code usage
-                promo.current_uses += 1
-                if promo.used_by is None:
-                    promo.used_by = []
-                promo.used_by.append(interaction.user.id)
+                # Update promo code usage safely
+                promo.current_uses = current_uses + 1
+                used_by.append(interaction.user.id)
+                promo.used_by = used_by
                 
                 embed = discord.Embed(
                     title="🎁 Promo Code Redeemed!",
@@ -503,30 +505,18 @@ class CollectionCog(commands.Cog):
                     color=discord.Color.gold()
                 )
                 
-                # Send interaction response - if this fails, we won't commit
-                try:
-                    await interaction.followup.send(embed=embed)
-                    # Only commit if interaction response succeeds
-                    await session.commit()
-                except Exception as send_error:
-                    # Rollback if interaction fails
-                    await session.rollback()
-                    logger.error(f"Failed to send promo code response, rolled back transaction: {send_error}")
-                    # Try to send error message (might also fail, but worth trying)
-                    try:
-                        await interaction.followup.send(
-                            "❌ Promo code processed but failed to display. Please check your collection.",
-                            ephemeral=True
-                        )
-                    except:
-                        pass
-                    raise
+                # Commit first, then send
+                await session.commit()
+                await interaction.followup.send(embed=embed)
         except Exception as e:
-            logger.error(f"Error in redeem: {e}", exc_info=True)
-            await interaction.followup.send(
-                "❌ An error occurred while redeeming the promo code.",
-                ephemeral=True
-            )
+            logger.error(f"Error in redeem_promo: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(
+                    "❌ An error occurred while redeeming the promo code.",
+                    ephemeral=True
+                )
+            except:
+                logger.error("Failed to send error message to user")
     
     @app_commands.command(name="buy", description="Get a link to the Patreon store")
     async def buy_link(self, interaction: discord.Interaction):
@@ -596,11 +586,14 @@ class CollectionCog(commands.Cog):
                 
                 await interaction.followup.send(embed=embed)
         except Exception as e:
-            logger.error(f"Error in redeem: {e}", exc_info=True)
-            await interaction.followup.send(
-                "❌ An error occurred while checking pack timers.",
-                ephemeral=True
-            )
+            logger.error(f"Error in pack_timer: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(
+                    "❌ An error occurred while checking pack timers.",
+                    ephemeral=True
+                )
+            except:
+                logger.error("Failed to send error message to user")
 
 async def setup(bot):
     await bot.add_cog(CollectionCog(bot))
