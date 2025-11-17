@@ -736,11 +736,11 @@ class MatchCog(commands.Cog):
                 for active in active_matches:
                     await session.delete(active)
                 
-                await session.commit()
-                
-                # Process any active bets
+                # Process any active bets BEFORE committing
                 await self._process_bets(session, guild_id, 
                                         match_state.player1_id, match_state.player2_id, winner_id)
+                
+                await session.commit()
             
             # Show match complete embed
             embed = EmbedBuilder.match_complete_embed(match_state, player1.name, player2.name)
@@ -775,10 +775,14 @@ class MatchCog(commands.Cog):
             )
         )
         bets = result.scalars().all()
+        logger.info(f"_process_bets: Found {len(bets)} bets for players {player1_id} vs {player2_id}, guild {guild_id}, winner: {winner_id}")
         
         for bet in bets:
+            logger.info(f"Processing bet {bet.id}: Creator={bet.creator_id}, Challenged={bet.challenged_id}, Creator Cards={bet.creator_cards}, Challenged Cards={bet.challenged_cards}")
+            
             if winner_id is None:
                 # Draw - return cards
+                logger.info(f"Bet {bet.id}: Draw occurred, marking completed without transfer")
                 bet.completed = True
                 continue
             
@@ -795,9 +799,9 @@ class MatchCog(commands.Cog):
                 loser_cards = bet.creator_cards or []
                 winner_id_bet = bet.challenged_id
             
-            # Remove cards from LOSER ONLY and give to winner
+            # Remove cards from LOSER and give to winner
             for card_id in loser_cards:
-                # Remove from loser
+                # Try to remove from loser first
                 result = await session.execute(
                     select(Collection)
                     .where(Collection.user_id == loser_id)
@@ -805,24 +809,29 @@ class MatchCog(commands.Cog):
                     .limit(1)
                 )
                 collection = result.scalar_one_or_none()
-                if collection:
-                    await session.delete(collection)
-                else:
-                    # Card not found in loser's collection - log warning
-                    logger.warning(f"Bet {bet.id}: Card {card_id} not found in loser's collection (user {loser_id})")
-                    continue
                 
-                # Give to winner
+                if collection:
+                    # Card found in loser's collection - remove it
+                    await session.delete(collection)
+                    logger.info(f"Bet {bet.id}: Removed card {card_id} from loser {loser_id}")
+                else:
+                    # Card not found in loser's collection (shouldn't happen, but log it)
+                    logger.warning(f"Bet {bet.id}: Card {card_id} not found in loser's collection (user {loser_id}). Skipping removal but still adding to winner.")
+                
+                # CRITICAL: Always add card to winner regardless of removal success
+                # (If card wasn't in loser's collection, they must have used it in the match)
                 new_collection = Collection(
                     user_id=winner_id_bet,
                     card_id=card_id
                 )
                 session.add(new_collection)
+                logger.info(f"Bet {bet.id}: Added card {card_id} to winner {winner_id_bet}")
             
             bet.completed = True
             bet.winner_id = winner_id
+            logger.info(f"Bet {bet.id}: Marked as completed with winner {winner_id}")
         
-        await session.commit()
+        # Note: Caller is responsible for committing the session
     
     @app_commands.command(name="bet", description="Bet cards against another user")
     @app_commands.describe(
