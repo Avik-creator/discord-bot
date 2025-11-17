@@ -4,7 +4,7 @@ from discord.ext import commands
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database.database import AsyncSessionLocal
-from database.models import User, Card, Collection, PromoCode, Logo, CardType, LogoRarity, ServerConfig
+from database.models import User, Card, Collection, PromoCode, Logo, CardType, LogoRarity, ServerConfig, ActiveMatch
 from utils.card_spawner import CardSpawner
 import random
 import asyncio
@@ -925,6 +925,69 @@ class AdminCog(commands.Cog):
     
     # Removed sync_commands - use bot owner commands for tree sync instead
     # The previous implementation would overwrite guild-specific command trees
+    
+    @app_commands.command(name="stop_match", description="[ADMIN] Force stop an active match in this channel")
+    @app_commands.check(is_admin_check)
+    async def stop_match(self, interaction: discord.Interaction):
+        """Force stop an active match"""
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Get the match cog
+            match_cog = self.bot.get_cog('MatchCog')
+            if not match_cog:
+                await interaction.followup.send(
+                    "❌ Match system is not available!",
+                    ephemeral=True
+                )
+                return
+            
+            # Check if there's an active match in this channel
+            match_state = await match_cog._get_match_state(interaction.channel_id)
+            if not match_state:
+                await interaction.followup.send(
+                    "❌ There is no active match in this channel!",
+                    ephemeral=True
+                )
+                return
+            
+            # Delete the match state
+            await match_cog._delete_match_state(interaction.channel_id)
+            
+            # Delete all active matches from database for this channel
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(ActiveMatch).where(ActiveMatch.channel_id == interaction.channel_id)
+                )
+                active_matches = result.scalars().all()
+                for active_match in active_matches:
+                    await session.delete(active_match)
+                if active_matches:
+                    await session.commit()
+            
+            # Get player mentions
+            player1 = await self.bot.fetch_user(match_state.player1_id)
+            player2 = await self.bot.fetch_user(match_state.player2_id)
+            
+            embed = discord.Embed(
+                title="🛑 Match Stopped",
+                description=f"The match between {player1.mention} and {player2.mention} has been forcefully stopped by an admin.",
+                color=discord.Color.orange()
+            )
+            
+            await interaction.followup.send(embed=embed)
+            
+            # Notify in channel
+            await interaction.channel.send(embed=embed)
+            
+        except Exception as e:
+            import logging
+            logger = logging.getLogger('discord_bot')
+            logger.error(f"Error in stop_match: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while stopping the match.",
+                ephemeral=True
+            )
     
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         """Handle app command errors for this cog"""

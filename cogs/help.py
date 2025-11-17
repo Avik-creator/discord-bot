@@ -189,6 +189,9 @@ class HelpCog(commands.Cog):
                     )
             except:
                 # If even error handling fails, just log it
-                logger.error("Failed to send help error message to user")async def setup(bot):
+                logger.error("Failed to send help error message to user")
+
+
+async def setup(bot):
     await bot.add_cog(HelpCog(bot))
 

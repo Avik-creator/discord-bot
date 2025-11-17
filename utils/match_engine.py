@@ -172,6 +172,7 @@ class MatchState:
         self.round_winners = []  # Track who won each round for verification
         
         self.current_turn = player1_id  # Who selects next
+        self.last_player1_position = None  # Store P1's selection for the round (sets are unordered!)
     
     def get_available_cards(self, player_id: int) -> Dict:
         """Get cards that haven't been used yet"""

@@ -99,6 +99,14 @@ class PlayerSelectView(discord.ui.View):
             )
             return
         
+        # Disable view immediately to prevent double-use
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except:
+            pass  # DM might be deleted, ignore
+        
         # Get the match channel (either from stored reference or current channel)
         match_channel = self.channel if self.channel else interaction.channel
         
@@ -203,43 +211,53 @@ class PlayerSelectView(discord.ui.View):
         # Check if both players have selected
         if self.user_id == self.match_state.player1_id:
             # Player 1 selected - switch turn to player 2
+            
+            # CRITICAL: Clear any stale position from previous rounds
+            self.match_state.last_player1_position = None
+            
+            # CRITICAL: Store P1's selection for when P2 picks (sets are unordered!)
+            self.match_state.last_player1_position = selected_position
+            
             self.match_state.current_turn = self.match_state.player2_id
             
             # CRITICAL: Save updated match state to Redis
             await self.cog._save_match_state(match_channel.id, self.match_state)
             
-            # CRITICAL: Get fresh match state from Redis to ensure dropdown is built with latest state
+            # CRITICAL: Get fresh match state from Redis
             fresh_state = await self.cog._get_match_state(match_channel.id)
             if not fresh_state:
                 logger.error("Failed to retrieve fresh match state after saving!")
                 return
             
-            # Player 1 selected, now wait for player 2
+            # Confirm to player 1
             await interaction.followup.send(
-                f"✅ You selected **{selected_card_name}** ({selected_position})!\n"
-                f"Waiting for <@{fresh_state.player2_id}>...",
+                f"✅ You selected **{selected_card_name}** ({selected_position})!",
                 ephemeral=True
             )
             
-            # Send public notification that player 2's turn started (without revealing info)
-            await match_channel.send(
-                f"⏳ <@{fresh_state.player2_id}>, it's your turn! Check your DMs or use `/pick` to see your options."
-            )
-            
-            # Notify player 2 with PRIVATE DM dropdown using FRESH state
-            await self.cog._send_player_pick_menu(match_channel.id, fresh_state.player2_id)
-            await self._send_player_pick_menu(interaction.channel_id, match_state.player1_id)
+            # Use centralized turn announcement
+            await self.cog._announce_turn(match_channel.id, fresh_state)
         else:
             # Player 2 selected, now play the round
-            # Get both selected positions
-            player1_used = list(self.match_state.player1_used_cards)
-            player2_used = list(self.match_state.player2_used_cards)
-            
-            player1_position = player1_used[-1]
+            # Get player 1's selection from stored position
+            player1_position = self.match_state.last_player1_position
             player2_position = selected_position
+            
+            if not player1_position:
+                logger.error("CRITICAL BUG: Player 1 position not stored!")
+                await interaction.followup.send(
+                    "❌ Error: Player 1's selection was not found!",
+                    ephemeral=True
+                )
+                return
+            
+            logger.info(f"Playing round with P1 position: {player1_position}, P2 position: {player2_position}")
             
             # Play round
             round_data = self.match_state.play_round(player1_position, player2_position)
+            
+            # DO NOT clear last_player1_position here - keep it so we can verify it was used correctly
+            # It will be cleared when Player 1 makes their NEXT selection
             
             # CRITICAL: Save updated match state to Redis after round is played
             await self.cog._save_match_state(match_channel.id, self.match_state)
@@ -273,13 +291,8 @@ class PlayerSelectView(discord.ui.View):
             if fresh_state.is_complete():
                 await self.cog._complete_match(interaction, fresh_state, match_channel)
             else:
-                # Next round - send public notification (no info leakage)
-                next_player_id = fresh_state.current_turn
-                await match_channel.send(
-                    f"⏳ **Round {fresh_state.current_round}** - <@{next_player_id}>, it's your turn! Check your DMs!"
-                )
-                # Send DM pick menu to next player using FRESH state
-                await self.cog._send_player_pick_menu(match_channel.id, next_player_id)
+                # Use centralized turn announcement
+                await self.cog._announce_turn(match_channel.id, fresh_state)
 
 class MatchCog(commands.Cog):
     """Match and betting commands"""
@@ -311,6 +324,21 @@ class MatchCog(commands.Cog):
         await redis_manager.delete_match_state(channel_id)
         if channel_id in self.active_matches:
             del self.active_matches[channel_id]
+    
+    async def _announce_turn(self, channel_id: int, match_state: MatchState):
+        """Centralized turn announcement - ONLY place to send turn notifications"""
+        next_id = match_state.current_turn
+        channel = self.bot.get_channel(channel_id)
+        
+        if not channel:
+            logger.error(f"Cannot announce turn: channel {channel_id} not found")
+            return
+        
+        await channel.send(
+            f"⏳ **Round {match_state.current_round}** - <@{next_id}>, it's your turn! Check your DMs!"
+        )
+        
+        await self._send_player_pick_menu(channel_id, next_id)
     
     async def _send_player_pick_menu(self, channel_id: int, user_id: int):
         """Send a PRIVATE (DM) pick menu to the correct player ONLY"""
@@ -581,16 +609,10 @@ class MatchCog(commands.Cog):
                     value="Team selections are private. Each player receives their options via ephemeral messages.",
                     inline=False
                 )
-                embed.add_field(
-                    name="Current Turn",
-                    value=f"**Round 1** - {interaction.user.mention} will receive their options privately.",
-                    inline=False
-                )
-                
                 await interaction.followup.send(embed=embed)
                 
-                # Send PRIVATE DM to player 1
-                await self._send_player_pick_menu(interaction.channel_id, interaction.user.id)
+                # Use centralized turn announcement for Round 1
+                await self._announce_turn(interaction.channel_id, match_state)
         except Exception as e:
             logger.error(f"Error in start_match: {e}", exc_info=True)
             await interaction.followup.send(
@@ -601,7 +623,6 @@ class MatchCog(commands.Cog):
     @app_commands.command(name="pick", description="Pick a player for the current match round (shows dropdown menu)")
     async def select_player(self, interaction: discord.Interaction):
         """Show player pick dropdown menu"""
-        # Defer immediately to avoid interaction timeout
         await interaction.response.defer(ephemeral=True)
         
         # Check if there's an active match
@@ -621,18 +642,13 @@ class MatchCog(commands.Cog):
             )
             return
         
-        # Get available cards
-        available_cards = match_state.get_available_cards(interaction.user.id)
-        
-        if not available_cards:
-            await interaction.followup.send(
-                "❌ No available players!",
-                ephemeral=True
-            )
-            return
-        
-        # Send the ephemeral pick menu using the helper (which handles duplicate prevention)
+        # Send pick menu (duplicate prevention handled inside)
         await self._send_player_pick_menu(interaction.channel_id, interaction.user.id)
+        
+        await interaction.followup.send(
+            "✅ Check your DMs for the pick menu!",
+            ephemeral=True
+        )
     
     async def _complete_match(self, interaction: discord.Interaction, match_state: MatchState, match_channel=None):
         """_complete_match"""
