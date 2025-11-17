@@ -186,6 +186,18 @@ class CardSpawner:
         spawn_data = self.active_spawns[message_id]
         card = spawn_data['card']
         
+        # CRITICAL: Check if card was already caught (race condition protection)
+        result = await session.execute(
+            select(SpawnedCard)
+            .where(SpawnedCard.id == spawn_data['spawned_card_id'])
+        )
+        spawned_card = result.scalar_one_or_none()
+        if not spawned_card or spawned_card.caught:
+            # Someone else caught it first
+            if message_id in self.active_spawns:
+                del self.active_spawns[message_id]
+            return False, "This card has already been caught by someone else!"
+        
         # Check if guess matches (case insensitive)
         if guess.lower().strip() != card.name.lower().strip():
             return False, f"Wrong name! Try again."

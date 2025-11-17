@@ -10,4 +10,6 @@ fastapi>=0.104.1
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
 PyNaCl>=1.5.0
+redis>=5.0.0
+hiredis>=2.2.3
 

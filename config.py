@@ -55,6 +55,13 @@ else:
 API_FOOTBALL_KEY = os.getenv('API_FOOTBALL_KEY')
 API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 
+# Redis Configuration
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
+REDIS_DB = int(os.getenv('REDIS_DB', '0'))
+REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')  # Optional
+REDIS_MATCH_TTL = int(os.getenv('REDIS_MATCH_TTL', '3600'))  # 1 hour default
+
 # Bot Configuration
 PATREON_STORE_LINK = os.getenv('PATREON_STORE_LINK', 'https://patreon.com/yourstore')
 SPAWN_MESSAGE_MIN = int(os.getenv('SPAWN_MESSAGE_MIN', '20'))

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, BigInteger, Boolean, DateTime, Float, ForeignKey, Text, JSON, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, BigInteger, Boolean, DateTime, Float, ForeignKey, Text, JSON, Enum as SQLEnum, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database.database import Base
@@ -121,6 +121,11 @@ class TeamSlot(Base):
     team_id = Column(Integer, ForeignKey('teams.id', ondelete='CASCADE'))
     card_id = Column(Integer, ForeignKey('cards.id', ondelete='CASCADE'))
     position = Column(String(10), nullable=False)  # LW, ST, RW, etc.
+    
+    # Add unique constraint to prevent duplicate position entries per team
+    __table_args__ = (
+        UniqueConstraint('team_id', 'position', name='uq_team_position'),
+    )
     
     # Relationships
     team = relationship("Team", back_populates="slots")

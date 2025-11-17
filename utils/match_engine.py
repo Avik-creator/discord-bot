@@ -211,21 +211,43 @@ class MatchState:
         # Get the card being selected
         if player_id == self.player1_id:
             card = self.player1_team[position]
+            
+            # PARANOID LOGGING - Log state BEFORE modifying
+            logger.info(f"[BEFORE] Player 1 select_card: position={position}, card={card.name} (ID:{card.id})")
+            logger.info(f"[BEFORE] Player 1 used_positions: {self.player1_used_cards}")
+            logger.info(f"[BEFORE] Player 1 used_card_ids: {self.player1_used_card_ids}")
+            
             # Double-check it's not already used
             if position in self.player1_used_cards or card.id in self.player1_used_card_ids:
                 logger.error(f"select_card: Card {card.name} (ID: {card.id}) at position {position} is already used for player 1!")
                 return False
+            
             self.player1_used_cards.add(position)
             self.player1_used_card_ids.add(card.id)  # Track by card ID too
+            
+            # PARANOID LOGGING - Log state AFTER modifying
+            logger.info(f"[AFTER] Player 1 used_positions: {self.player1_used_cards}")
+            logger.info(f"[AFTER] Player 1 used_card_ids: {self.player1_used_card_ids}")
             logger.info(f"select_card: Marked card {card.name} (ID: {card.id}) at position {position} as used for player 1")
         else:
             card = self.player2_team[position]
+            
+            # PARANOID LOGGING - Log state BEFORE modifying
+            logger.info(f"[BEFORE] Player 2 select_card: position={position}, card={card.name} (ID:{card.id})")
+            logger.info(f"[BEFORE] Player 2 used_positions: {self.player2_used_cards}")
+            logger.info(f"[BEFORE] Player 2 used_card_ids: {self.player2_used_card_ids}")
+            
             # Double-check it's not already used
             if position in self.player2_used_cards or card.id in self.player2_used_card_ids:
                 logger.error(f"select_card: Card {card.name} (ID: {card.id}) at position {position} is already used for player 2!")
                 return False
+            
             self.player2_used_cards.add(position)
             self.player2_used_card_ids.add(card.id)  # Track by card ID too
+            
+            # PARANOID LOGGING - Log state AFTER modifying
+            logger.info(f"[AFTER] Player 2 used_positions: {self.player2_used_cards}")
+            logger.info(f"[AFTER] Player 2 used_card_ids: {self.player2_used_card_ids}")
             logger.info(f"select_card: Marked card {card.name} (ID: {card.id}) at position {position} as used for player 2")
         
         return True

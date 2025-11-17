@@ -7,6 +7,7 @@ from database.database import AsyncSessionLocal
 from database.models import User, Team, TeamSlot, Card, Match, ActiveMatch, Bet, Leaderboard, Collection
 from utils.embeds import EmbedBuilder
 from utils.match_engine import MatchEngine, MatchState
+from utils.redis_manager import redis_manager
 from typing import Dict, Optional
 import json
 import logging
@@ -16,11 +17,13 @@ logger = logging.getLogger('discord_bot')
 class PlayerSelectView(discord.ui.View):
     """View with select menu for picking players"""
     
-    def __init__(self, match_state: MatchState, user_id: int, cog_instance):
+    def __init__(self, match_state: MatchState, user_id: int, cog_instance, channel=None):
         super().__init__(timeout=300)  # 5 minute timeout
         self.match_state = match_state
         self.user_id = user_id
         self.cog = cog_instance
+        self.channel = channel  # Store channel reference for DM responses
+        self.created_for_round = match_state.current_round  # Track which round this view is for
         
         # Validate user_id is one of the players
         if user_id != match_state.player1_id and user_id != match_state.player2_id:
@@ -96,9 +99,26 @@ class PlayerSelectView(discord.ui.View):
             )
             return
         
-        if interaction.channel_id not in self.cog.active_matches:
+        # Get the match channel (either from stored reference or current channel)
+        match_channel = self.channel if self.channel else interaction.channel
+        
+        # CRITICAL: Get fresh match state from Redis/memory
+        current_match_state = await self.cog._get_match_state(match_channel.id)
+        if not current_match_state:
             await interaction.response.send_message(
-                "❌ No active match in this channel!",
+                "❌ No active match found!",
+                ephemeral=True
+            )
+            return
+        
+        # Update our reference to the fresh state
+        self.match_state = current_match_state
+        
+        # CRITICAL: Verify this is for the current round (prevent stale view usage)
+        if self.created_for_round != self.match_state.current_round:
+            await interaction.response.send_message(
+                f"❌ This menu is for Round {self.created_for_round}, but we're now on Round {self.match_state.current_round}!\n"
+                f"Please use the latest menu sent to you.",
                 ephemeral=True
             )
             return
@@ -184,15 +204,31 @@ class PlayerSelectView(discord.ui.View):
         if self.user_id == self.match_state.player1_id:
             # Player 1 selected - switch turn to player 2
             self.match_state.current_turn = self.match_state.player2_id
+            
+            # CRITICAL: Save updated match state to Redis
+            await self.cog._save_match_state(match_channel.id, self.match_state)
+            
+            # CRITICAL: Get fresh match state from Redis to ensure dropdown is built with latest state
+            fresh_state = await self.cog._get_match_state(match_channel.id)
+            if not fresh_state:
+                logger.error("Failed to retrieve fresh match state after saving!")
+                return
+            
             # Player 1 selected, now wait for player 2
             await interaction.followup.send(
                 f"✅ You selected **{selected_card_name}** ({selected_position})!\n"
-                f"Waiting for <@{self.match_state.player2_id}>...",
+                f"Waiting for <@{fresh_state.player2_id}>...",
                 ephemeral=True
             )
             
-            # Notify player 2 with dropdown
-            await self.cog._send_player_pick_menu(interaction.channel, self.match_state, self.match_state.player2_id)
+            # Send public notification that player 2's turn started (without revealing info)
+            await match_channel.send(
+                f"⏳ <@{fresh_state.player2_id}>, it's your turn! Check your DMs or use `/pick` to see your options."
+            )
+            
+            # Notify player 2 with PRIVATE DM dropdown using FRESH state
+            await self.cog._send_player_pick_menu(match_channel.id, fresh_state.player2_id)
+            await self._send_player_pick_menu(interaction.channel_id, match_state.player1_id)
         else:
             # Player 2 selected, now play the round
             # Get both selected positions
@@ -205,9 +241,18 @@ class PlayerSelectView(discord.ui.View):
             # Play round
             round_data = self.match_state.play_round(player1_position, player2_position)
             
-            # Show round result
-            player1 = await self.cog.bot.fetch_user(self.match_state.player1_id)
-            player2 = await self.cog.bot.fetch_user(self.match_state.player2_id)
+            # CRITICAL: Save updated match state to Redis after round is played
+            await self.cog._save_match_state(match_channel.id, self.match_state)
+            
+            # CRITICAL: Get fresh match state from Redis to ensure next dropdown is built with latest state
+            fresh_state = await self.cog._get_match_state(match_channel.id)
+            if not fresh_state:
+                logger.error("Failed to retrieve fresh match state after saving!")
+                return
+            
+            # Show round result PUBLICLY in channel
+            player1 = await self.cog.bot.fetch_user(fresh_state.player1_id)
+            player2 = await self.cog.bot.fetch_user(fresh_state.player2_id)
             
             embed = EmbedBuilder.match_round_embed(
                 round_data,
@@ -215,26 +260,67 @@ class PlayerSelectView(discord.ui.View):
                 player2.name
             )
             
-            await interaction.followup.send(embed=embed)
+            # Send confirmation to player 2 ephemerally
+            await interaction.followup.send(
+                f"✅ You selected **{selected_card_name}** ({selected_position})!",
+                ephemeral=True
+            )
+            
+            # Post round result publicly
+            await match_channel.send(embed=embed)
             
             # Check if match is complete
-            if self.match_state.is_complete():
-                await self.cog._complete_match(interaction, self.match_state)
+            if fresh_state.is_complete():
+                await self.cog._complete_match(interaction, fresh_state, match_channel)
             else:
-                # Next round - send pick menu to next player
-                await self.cog._send_player_pick_menu(interaction.channel, self.match_state, self.match_state.current_turn)
+                # Next round - send public notification (no info leakage)
+                next_player_id = fresh_state.current_turn
+                await match_channel.send(
+                    f"⏳ **Round {fresh_state.current_round}** - <@{next_player_id}>, it's your turn! Check your DMs!"
+                )
+                # Send DM pick menu to next player using FRESH state
+                await self.cog._send_player_pick_menu(match_channel.id, next_player_id)
 
 class MatchCog(commands.Cog):
     """Match and betting commands"""
     
     def __init__(self, bot):
         self.bot = bot
+        # Fallback in-memory storage if Redis unavailable
         self.active_matches = {}  # {channel_id: MatchState}
-        self.last_dropdown_sent = {}  # {channel_id: (round, user_id)} - Track last dropdown sent to prevent duplicates
+        self.last_dropdown_sent = {}  # {channel_id: {"round": int, "users_sent": set()}} - Track dropdowns sent per user per round
     
-    async def _send_player_pick_menu(self, channel, match_state: MatchState, user_id: int):
-        """Send a message with player pick dropdown menu - only usable by the specified user"""
+    async def _get_match_state(self, channel_id: int) -> Optional[MatchState]:
+        """Get match state from Redis or fallback to memory"""
+        # Try Redis first
+        match_state = await redis_manager.get_match_state(channel_id)
+        if match_state:
+            return match_state
+        # Fallback to in-memory
+        return self.active_matches.get(channel_id)
+    
+    async def _save_match_state(self, channel_id: int, match_state: MatchState):
+        """Save match state to Redis and memory"""
+        # Save to Redis
+        await redis_manager.save_match_state(channel_id, match_state)
+        # Also keep in memory as fallback
+        self.active_matches[channel_id] = match_state
+    
+    async def _delete_match_state(self, channel_id: int):
+        """Delete match state from Redis and memory"""
+        await redis_manager.delete_match_state(channel_id)
+        if channel_id in self.active_matches:
+            del self.active_matches[channel_id]
+    
+    async def _send_player_pick_menu(self, channel_id: int, user_id: int):
+        """Send a PRIVATE (DM) pick menu to the correct player ONLY"""
         try:
+            # CRITICAL: Always get fresh state from Redis first
+            match_state = await self._get_match_state(channel_id)
+            if not match_state:
+                logger.error(f"No match state found for channel {channel_id}")
+                return
+            
             # Validate user_id is one of the players
             if user_id != match_state.player1_id and user_id != match_state.player2_id:
                 logger.error(f"Invalid user_id {user_id} passed to _send_player_pick_menu. Player1: {match_state.player1_id}, Player2: {match_state.player2_id}")
@@ -245,16 +331,18 @@ class MatchCog(commands.Cog):
                 logger.error(f"ERROR: Attempted to send pick menu to user {user_id} but current_turn is {match_state.current_turn}. Aborting to prevent showing wrong team!")
                 return
             
-            # CRITICAL: Prevent duplicate dropdowns - check if we already sent one for this round
-            channel_key = channel.id
-            last_sent = self.last_dropdown_sent.get(channel_key)
-            if last_sent and last_sent[0] == match_state.current_round:
-                logger.error(f"DUPLICATE DROPDOWN PREVENTED: Already sent dropdown for round {match_state.current_round} to user {last_sent[1]}. Attempted to send to user {user_id}. Aborting!")
+
+            
+            # Check if already sent using Redis (with fallback to memory)
+            already_sent = await redis_manager.check_and_mark_dropdown_sent(
+                channel_id, match_state.current_round, user_id
+            )
+            
+            if already_sent:
+                logger.warning(f"DUPLICATE DROPDOWN PREVENTED: Already sent dropdown for round {match_state.current_round} to user {user_id}. Skipping!")
                 return
             
-            # Track that we're sending this dropdown
-            self.last_dropdown_sent[channel_key] = (match_state.current_round, user_id)
-            logger.info(f"Sending pick menu to user {user_id} for round {match_state.current_round}")
+            logger.info(f"Sending PRIVATE DM pick menu to user {user_id} for round {match_state.current_round}")
             
             user = await self.bot.fetch_user(user_id)
             
@@ -262,16 +350,18 @@ class MatchCog(commands.Cog):
             available_cards = match_state.get_available_cards(user_id)
             
             # Log for debugging
-            logger.info(f"Sending pick menu to user {user_id} (name: {user.name}) for round {match_state.current_round}. Available cards: {len(available_cards)}")
+            logger.info(f"Sending PRIVATE DM to user {user_id} (name: {user.name}) for round {match_state.current_round}. Available cards: {len(available_cards)}")
             if user_id == match_state.player1_id:
                 logger.info(f"Player 1 used positions: {match_state.player1_used_cards}, used card IDs: {match_state.player1_used_card_ids}")
+                logger.info(f"Player 1 available positions: {list(available_cards.keys())}")
             else:
                 logger.info(f"Player 2 used positions: {match_state.player2_used_cards}, used card IDs: {match_state.player2_used_card_ids}")
+                logger.info(f"Player 2 available positions: {list(available_cards.keys())}")
             
             embed = discord.Embed(
-                title=f"⚽ {user.display_name}'s Turn!",
-                description=f"**Round {match_state.current_round}** - <@{user_id}>, select a player from the dropdown below!\n\n"
-                          f"⚠️ **Only {user.display_name} can use this dropdown.**",
+                title=f"⚽ Your Turn - Round {match_state.current_round}!",
+                description=f"Select a player from the dropdown below!\n\n"
+                          f"🔒 **This is a private DM - your opponent cannot see this.**",
                 color=discord.Color.blue()
             )
             
@@ -284,20 +374,45 @@ class MatchCog(commands.Cog):
                 player_list.append(f"\n... and {len(available_cards) - 15} more players available")
             
             embed.add_field(
-                name=f"📋 Available Players ({len(available_cards)} remaining)",
+                name=f"📋 Your Available Players ({len(available_cards)} remaining)",
                 value="\n".join(player_list) if player_list else "No players available",
                 inline=False
             )
             
-            embed.set_footer(text=f"Only {user.display_name} can use the dropdown below")
+            # Get the match channel
+            match_channel = self.bot.get_channel(channel_id)
             
-            # Create view with validated user_id
-            view = PlayerSelectView(match_state, user_id, self)
+            # Set footer with channel name if available
+            if match_channel and hasattr(match_channel, 'name'):
+                embed.set_footer(text=f"Match in #{match_channel.name}")
+            else:
+                embed.set_footer(text="Match in progress")
             
-            # Log for debugging
-            logger.info(f"Sending pick menu to user {user_id} (name: {user.name}) for match in channel {channel.id}. Current turn: {match_state.current_turn}")
+            # Create view with validated user_id and channel reference
+            view = PlayerSelectView(match_state, user_id, self, match_channel)
             
-            await channel.send(f"<@{user_id}>", embed=embed, view=view)
+            # SEND VIA DM - TRUE PRIVACY
+            try:
+                await user.send(embed=embed, view=view)
+                logger.info(f"Successfully sent DM pick menu to user {user_id}")
+            except discord.Forbidden:
+                # User has DMs disabled - fallback to ephemeral in channel
+                logger.warning(f"User {user_id} has DMs disabled, sending ephemeral message instead")
+                if user_id == interaction.user.id:
+                    # Can only send ephemeral to the user who triggered the interaction
+                    await interaction.followup.send(
+                        content=f"⚠️ **Enable your DMs for private picks!**",
+                        embed=embed,
+                        view=view,
+                        ephemeral=True
+                    )
+                else:
+                    # Cannot send ephemeral to other user - send channel message with warning
+                    await interaction.channel.send(
+                        content=f"<@{user_id}> ⚠️ **Please enable your DMs!** Using public message (opponent can see your team):",
+                        embed=embed,
+                        view=view
+                    )
         except Exception as e:
             logger.error(f"Error sending player pick menu: {e}", exc_info=True)
     
@@ -391,7 +506,8 @@ class MatchCog(commands.Cog):
             return
         
         # Check if there's already an active match in this channel
-        if interaction.channel_id in self.active_matches:
+        existing_match = await self._get_match_state(interaction.channel_id)
+        if existing_match:
             await interaction.followup.send(
                 "❌ There's already an active match in this channel!",
                 ephemeral=True
@@ -428,8 +544,8 @@ class MatchCog(commands.Cog):
                     player2_formation=player2_team.formation
                 )
                 
-                # Store in active matches
-                self.active_matches[interaction.channel_id] = match_state
+                # Store in Redis and active matches
+                await self._save_match_state(interaction.channel_id, match_state)
                 
                 # Create active match record in database
                 active_match = ActiveMatch(
@@ -444,57 +560,38 @@ class MatchCog(commands.Cog):
                 session.add(active_match)
                 await session.commit()
                 
-                # Create match announcement
+                # Create PUBLIC match announcement (NO team info - that's private!)
                 embed = discord.Embed(
                     title="⚽ Match Started!",
-                    description=f"{interaction.user.mention} vs {opponent.mention}",
+                    description=f"**{interaction.user.mention}** vs **{opponent.mention}**\n\n"
+                               f"🎮 11 rounds of tactical football!",
                     color=discord.Color.blue()
                 )
                 embed.add_field(
                     name="How to Play",
-                    value="Each player selects a card for 11 rounds.\n"
-                          "Odd rounds: Player 1 attacks\n"
-                          "Even rounds: Player 2 attacks\n"
-                          "Attack stat vs Defense stat wins the round!",
+                    value="• Each player selects 1 card per round\n"
+                          "• Odd rounds: Player 1 attacks\n"
+                          "• Even rounds: Player 2 attacks\n"
+                          "• Attack stat vs Defense stat determines winner\n"
+                          "• Winner of most rounds wins the match!",
                     inline=False
                 )
-                
-                # Show available players for both players
-                player1_cards = match_state.get_available_cards(interaction.user.id)
-                player2_cards = match_state.get_available_cards(opponent.id)
-                
-                p1_list = [f"**{card.name}** ({pos})" for pos, card in list(player1_cards.items())[:8]]
-                if len(player1_cards) > 8:
-                    p1_list.append(f"... and {len(player1_cards) - 8} more")
-                
-                p2_list = [f"**{card.name}** ({pos})" for pos, card in list(player2_cards.items())[:8]]
-                if len(player2_cards) > 8:
-                    p2_list.append(f"... and {len(player2_cards) - 8} more")
-                
                 embed.add_field(
-                    name=f"👤 {interaction.user.display_name}'s Team ({len(player1_cards)} players)",
-                    value="\n".join(p1_list) if p1_list else "No players",
-                    inline=True
+                    name="🔒 Privacy",
+                    value="Team selections are private. Each player receives their options via ephemeral messages.",
+                    inline=False
                 )
-                embed.add_field(
-                    name=f"👤 {opponent.display_name}'s Team ({len(player2_cards)} players)",
-                    value="\n".join(p2_list) if p2_list else "No players",
-                    inline=True
-                )
-                
                 embed.add_field(
                     name="Current Turn",
-                    value=f"{interaction.user.mention} - Select a player from the dropdown below!",
+                    value=f"**Round 1** - {interaction.user.mention} will receive their options privately.",
                     inline=False
                 )
                 
                 await interaction.followup.send(embed=embed)
                 
-                # Send player pick menu
-                await self._send_player_pick_menu(interaction.channel, match_state, interaction.user.id)
+                # Send PRIVATE DM to player 1
+                await self._send_player_pick_menu(interaction.channel_id, interaction.user.id)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in start_match: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while starting the match.",
@@ -508,14 +605,13 @@ class MatchCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         
         # Check if there's an active match
-        if interaction.channel_id not in self.active_matches:
+        match_state = await self._get_match_state(interaction.channel_id)
+        if not match_state:
             await interaction.followup.send(
                 "❌ No active match in this channel!",
                 ephemeral=True
             )
             return
-        
-        match_state = self.active_matches[interaction.channel_id]
         
         # Check if it's this user's turn
         if match_state.current_turn != interaction.user.id:
@@ -535,17 +631,10 @@ class MatchCog(commands.Cog):
             )
             return
         
-        # Create and send pick menu
-        embed = discord.Embed(
-            title="⚽ Select Your Player",
-            description=f"Choose a player for Round {match_state.current_round}",
-            color=discord.Color.blue()
-        )
-        
-        view = PlayerSelectView(match_state, interaction.user.id, self)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        # Send the ephemeral pick menu using the helper (which handles duplicate prevention)
+        await self._send_player_pick_menu(interaction.channel_id, interaction.user.id)
     
-    async def _complete_match(self, interaction: discord.Interaction, match_state: MatchState):
+    async def _complete_match(self, interaction: discord.Interaction, match_state: MatchState, match_channel=None):
         """_complete_match"""
         # Note: This is a helper function called from within a command that already deferred
         # Do not defer here as the interaction was already handled
@@ -580,8 +669,11 @@ class MatchCog(commands.Cog):
                     draws = sum(1 for w in match_state.round_winners if w is None)
                     logger.info(f"Round winners summary: Player 1 wins={p1_wins}, Player 2 wins={p2_wins}, Draws={draws}")
                 
+                # Get guild_id from match_channel if available, otherwise from interaction
+                guild_id = match_channel.guild.id if match_channel else interaction.guild.id
+                
                 match_record = Match(
-                    guild_id=interaction.guild.id,
+                    guild_id=guild_id,
                     player1_id=match_state.player1_id,
                     player2_id=match_state.player2_id,
                     player1_score=match_state.player1_score,
@@ -609,19 +701,20 @@ class MatchCog(commands.Cog):
                 
                 # Update leaderboard
                 await self._update_leaderboard(
-                    session, interaction.guild.id, match_state.player1_id,
+                    session, guild_id, match_state.player1_id,
                     won=(winner_id == match_state.player1_id),
                     draw=(winner_id is None)
                 )
                 await self._update_leaderboard(
-                    session, interaction.guild.id, match_state.player2_id,
+                    session, guild_id, match_state.player2_id,
                     won=(winner_id == match_state.player2_id),
                     draw=(winner_id is None)
                 )
                 
                 # Remove active match - handle multiple matches if they exist
+                channel_id = match_channel.id if match_channel else interaction.channel_id
                 result = await session.execute(
-                    select(ActiveMatch).where(ActiveMatch.channel_id == interaction.channel_id)
+                    select(ActiveMatch).where(ActiveMatch.channel_id == channel_id)
                 )
                 active_matches = result.scalars().all()
                 for active in active_matches:
@@ -630,18 +723,19 @@ class MatchCog(commands.Cog):
                 await session.commit()
                 
                 # Process any active bets
-                await self._process_bets(session, interaction.guild.id, 
+                await self._process_bets(session, guild_id, 
                                         match_state.player1_id, match_state.player2_id, winner_id)
             
             # Show match complete embed
             embed = EmbedBuilder.match_complete_embed(match_state, player1.name, player2.name)
-            await interaction.channel.send(embed=embed)
+            # Send to match channel if available, otherwise to interaction channel
+            target_channel = match_channel if match_channel else interaction.channel
+            await target_channel.send(embed=embed)
             
-            # Remove from active matches
-            del self.active_matches[interaction.channel_id]
+            # Remove from Redis and active matches
+            channel_id = match_channel.id if match_channel else interaction.channel_id
+            await self._delete_match_state(channel_id)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in _complete_match: {e}", exc_info=True)
             # Try to send error message
             try:
@@ -673,19 +767,19 @@ class MatchCog(commands.Cog):
                 continue
             
             # Transfer cards to winner
-            # Winner gets the loser's cards
+            # Winner keeps their cards AND gets the loser's cards
             if winner_id == bet.creator_id:
-                # Creator won - they get challenged's cards
+                # Creator won - they get challenged's cards (keep their own)
                 loser_id = bet.challenged_id
                 loser_cards = bet.challenged_cards or []
                 winner_id_bet = bet.creator_id
             else:
-                # Challenged won - they get creator's cards
+                # Challenged won - they get creator's cards (keep their own)
                 loser_id = bet.creator_id
                 loser_cards = bet.creator_cards or []
                 winner_id_bet = bet.challenged_id
             
-            # Remove cards from loser and give to winner
+            # Remove cards from LOSER ONLY and give to winner
             for card_id in loser_cards:
                 # Remove from loser
                 result = await session.execute(
@@ -697,6 +791,10 @@ class MatchCog(commands.Cog):
                 collection = result.scalar_one_or_none()
                 if collection:
                     await session.delete(collection)
+                else:
+                    # Card not found in loser's collection - log warning
+                    logger.warning(f"Bet {bet.id}: Card {card_id} not found in loser's collection (user {loser_id})")
+                    continue
                 
                 # Give to winner
                 new_collection = Collection(

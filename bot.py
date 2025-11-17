@@ -5,6 +5,7 @@ import logging
 from database.database import init_db, AsyncSessionLocal
 from database.models import ServerConfig
 from utils.card_spawner import CardSpawner
+from utils.redis_manager import redis_manager
 from sqlalchemy import select
 import config
 from api_server import app
@@ -44,6 +45,15 @@ class FootballCardBot(commands.Bot):
         """Setup hook called when bot is starting"""
         logger.info("Initializing database...")
         await init_db()
+        
+        # Initialize Redis connection
+        logger.info("Connecting to Redis...")
+        try:
+            await redis_manager.connect()
+            logger.info("Redis connected successfully")
+        except Exception as e:
+            logger.warning(f"Redis connection failed: {e}")
+            logger.warning("Bot will continue with in-memory state storage (matches won't persist across restarts)")
         
         logger.info("Loading cogs...")
         cogs = [
@@ -330,6 +340,10 @@ def main():
         logger.info("Bot shutdown requested")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+    finally:
+        # Cleanup Redis connection
+        asyncio.run(redis_manager.close())
+        logger.info("Redis connection closed")
 
 if __name__ == "__main__":
     main()

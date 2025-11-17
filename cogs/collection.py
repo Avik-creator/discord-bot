@@ -8,7 +8,10 @@ from database.models import User, Card, Collection, PromoCode, CardType
 from utils.embeds import EmbedBuilder
 from utils.api_football import APIFootball
 from datetime import datetime, timedelta
+import logging
 import config
+
+logger = logging.getLogger('discord_bot')
 
 class CollectionCog(commands.Cog):
     """Collection and pack commands"""
@@ -166,8 +169,6 @@ class CollectionCog(commands.Cog):
                 except Exception as send_error:
                     # Rollback if interaction fails
                     await session.rollback()
-                    import logging
-                    logger = logging.getLogger('discord_bot')
                     logger.error(f"Failed to send pack response, rolled back transaction: {send_error}")
                     # Try to send error message (might also fail, but worth trying)
                     try:
@@ -179,9 +180,7 @@ class CollectionCog(commands.Cog):
                         pass
                     raise
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
-            logger.error(f"Error in open_pack: {e}", exc_info=True)
+            logger.error(f"Error in pack: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while opening the pack. Please try again.",
                 ephemeral=True
@@ -262,9 +261,7 @@ class CollectionCog(commands.Cog):
             
             await interaction.followup.send(embed=embed)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
-            logger.error(f"Error in view_collection: {e}", exc_info=True)
+            logger.error(f"Error in collection: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while loading your collection.",
                 ephemeral=True
@@ -299,11 +296,9 @@ class CollectionCog(commands.Cog):
             embed = EmbedBuilder.card_embed(card, show_full=True)
             await interaction.followup.send(embed=embed)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
-            logger.error(f"Error in show_card: {e}", exc_info=True)
+            logger.error(f"Error in compare: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An error occurred while loading the card.",
+                "❌ An error occurred while comparing cards.",
                 ephemeral=True
             )
     
@@ -329,9 +324,7 @@ class CollectionCog(commands.Cog):
             embed = EmbedBuilder.stats_embed(user)
             await interaction.followup.send(embed=embed)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
-            logger.error(f"Error in view_stats: {e}", exc_info=True)
+            logger.error(f"Error in stats: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while loading your stats.",
                 ephemeral=True
@@ -394,8 +387,6 @@ class CollectionCog(commands.Cog):
                 except Exception as send_error:
                     # Rollback if interaction fails
                     await session.rollback()
-                    import logging
-                    logger = logging.getLogger('discord_bot')
                     logger.error(f"Failed to send vote reward response, rolled back transaction: {send_error}")
                     # Try to send error message (might also fail, but worth trying)
                     try:
@@ -407,9 +398,7 @@ class CollectionCog(commands.Cog):
                         pass
                     raise
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
-            logger.error(f"Error in vote_reward: {e}", exc_info=True)
+            logger.error(f"Error in trade: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while processing your vote.",
                 ephemeral=True
@@ -522,8 +511,6 @@ class CollectionCog(commands.Cog):
                 except Exception as send_error:
                     # Rollback if interaction fails
                     await session.rollback()
-                    import logging
-                    logger = logging.getLogger('discord_bot')
                     logger.error(f"Failed to send promo code response, rolled back transaction: {send_error}")
                     # Try to send error message (might also fail, but worth trying)
                     try:
@@ -535,9 +522,7 @@ class CollectionCog(commands.Cog):
                         pass
                     raise
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
-            logger.error(f"Error in redeem_promo: {e}", exc_info=True)
+            logger.error(f"Error in redeem: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while redeeming the promo code.",
                 ephemeral=True
@@ -611,9 +596,7 @@ class CollectionCog(commands.Cog):
                 
                 await interaction.followup.send(embed=embed)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
-            logger.error(f"Error in pack_timer: {e}", exc_info=True)
+            logger.error(f"Error in redeem: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while checking pack timers.",
                 ephemeral=True

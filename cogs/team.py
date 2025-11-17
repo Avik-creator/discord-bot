@@ -8,7 +8,11 @@ from database.database import AsyncSessionLocal
 from database.models import User, Team, TeamSlot, Card, Collection, Logo
 from utils.embeds import EmbedBuilder
 from utils.formations import FormationManager
+import logging
 import config
+
+logger = logging.getLogger('discord_bot')
+
 
 class TeamCog(commands.Cog):
     """Team management commands"""
@@ -65,8 +69,6 @@ class TeamCog(commands.Cog):
             
             await interaction.followup.send(embed=embed)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in start_team: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while creating your team.",
@@ -121,8 +123,6 @@ class TeamCog(commands.Cog):
                 
                 await interaction.followup.send(embed=embed)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in select_lineup: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while selecting the formation.",
@@ -206,8 +206,6 @@ class TeamCog(commands.Cog):
                 embed = EmbedBuilder.team_embed(user, team, team_slots, logo_bonus)
                 await interaction.followup.send(embed=embed)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in view_team: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while loading your team.",
@@ -329,8 +327,6 @@ class TeamCog(commands.Cog):
                     except Exception as send_error:
                         # Rollback if interaction fails
                         await session.rollback()
-                        import logging
-                        logger = logging.getLogger('discord_bot')
                         logger.error(f"Failed to send player add response, rolled back transaction: {send_error}")
                         # Try to send error message (might also fail, but worth trying)
                         try:
@@ -374,8 +370,6 @@ class TeamCog(commands.Cog):
                     except Exception as send_error:
                         # Rollback if interaction fails
                         await session.rollback()
-                        import logging
-                        logger = logging.getLogger('discord_bot')
                         logger.error(f"Failed to send player remove response, rolled back transaction: {send_error}")
                         # Try to send error message (might also fail, but worth trying)
                         try:
@@ -403,7 +397,7 @@ class TeamCog(commands.Cog):
                         .where(TeamSlot.team_id == team.id)
                         .where(TeamSlot.position.in_([position, position2]))
                     )
-                    slots = result.all()
+                    slots = result.scalars().all()
                     
                     if len(slots) != 2:
                         await interaction.followup.send(
@@ -412,7 +406,16 @@ class TeamCog(commands.Cog):
                         )
                         return
                     
-                    slot1, slot2 = slots[0], slots[1]
+                    # Find which slot is which position
+                    slot1 = next((s for s in slots if s.position == position), None)
+                    slot2 = next((s for s in slots if s.position == position2), None)
+                    
+                    if not slot1 or not slot2:
+                        await interaction.followup.send(
+                            "❌ Could not find both positions!",
+                            ephemeral=True
+                        )
+                        return
                     
                     # Swap card IDs
                     slot1.card_id, slot2.card_id = slot2.card_id, slot1.card_id
@@ -431,8 +434,6 @@ class TeamCog(commands.Cog):
                     except Exception as send_error:
                         # Rollback if interaction fails
                         await session.rollback()
-                        import logging
-                        logger = logging.getLogger('discord_bot')
                         logger.error(f"Failed to send player swap response, rolled back transaction: {send_error}")
                         # Try to send error message (might also fail, but worth trying)
                         try:
@@ -444,8 +445,6 @@ class TeamCog(commands.Cog):
                             pass
                         raise
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in player_manage: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while managing players.",
@@ -514,8 +513,6 @@ class TeamCog(commands.Cog):
                 
                 return self._get_position_suggestions(team, query)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in position_autocomplete: {e}", exc_info=True)
             # Fallback to common positions
             common_positions = ['GK', 'LB', 'LCB', 'RCB', 'RB', 'LCM', 'CM', 'RCM', 'LW', 'ST', 'RW']
@@ -539,8 +536,6 @@ class TeamCog(commands.Cog):
                 
                 return self._get_position_suggestions(team, query)
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in position2_autocomplete: {e}", exc_info=True)
             # Fallback to common positions
             common_positions = ['GK', 'LB', 'LCB', 'RCB', 'RB', 'LCM', 'CM', 'RCM', 'LW', 'ST', 'RW']
@@ -595,8 +590,6 @@ class TeamCog(commands.Cog):
                 
                 return suggestions[:25]  # Discord limit is 25
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in player_name_autocomplete: {e}", exc_info=True)
             return []
     
@@ -684,8 +677,6 @@ class TeamCog(commands.Cog):
                     except Exception as send_error:
                         # Rollback if interaction fails
                         await session.rollback()
-                        import logging
-                        logger = logging.getLogger('discord_bot')
                         logger.error(f"Failed to send logo add response, rolled back transaction: {send_error}")
                         # Try to send error message (might also fail, but worth trying)
                         try:
@@ -721,8 +712,6 @@ class TeamCog(commands.Cog):
                     except Exception as send_error:
                         # Rollback if interaction fails
                         await session.rollback()
-                        import logging
-                        logger = logging.getLogger('discord_bot')
                         logger.error(f"Failed to send logo remove response, rolled back transaction: {send_error}")
                         # Try to send error message (might also fail, but worth trying)
                         try:
@@ -734,8 +723,6 @@ class TeamCog(commands.Cog):
                             pass
                         raise
         except Exception as e:
-            import logging
-            logger = logging.getLogger('discord_bot')
             logger.error(f"Error in logo_manage: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while managing your logo.",
