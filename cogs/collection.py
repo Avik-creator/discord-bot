@@ -262,8 +262,6 @@ class CollectionCog(commands.Cog):
                 user = await self._get_or_create_user(
                     session, interaction.user.id, interaction.user.name
                 )
-</parameter>
-
 
                 # Check cooldown
                 can_use, seconds_remaining = await self._check_cooldown(user, pack_type)

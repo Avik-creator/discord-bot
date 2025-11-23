@@ -290,6 +290,9 @@ class PlayerSelectView(discord.ui.View):
             )
 
             # Use centralized turn announcement
+            logger.info(
+                f"Player 1 selected. Announcing Player 2's turn for Round {fresh_state.current_round}"
+            )
             await self.cog._announce_turn(match_channel.id, fresh_state)
         else:
             # Player 2 selected, now play the round
@@ -308,16 +311,24 @@ class PlayerSelectView(discord.ui.View):
                 f"Playing round with P1 position: {player1_position}, P2 position: {player2_position}"
             )
 
-            # Play round
-            round_data = self.match_state.play_round(player1_position, player2_position)
+            # CRITICAL: Get fresh match state BEFORE playing round to ensure we're working with latest data
+            fresh_state = await self.cog._get_match_state(match_channel.id)
+            if not fresh_state:
+                logger.error(
+                    "Failed to retrieve fresh match state before playing round!"
+                )
+                return
+
+            # Play round on the FRESH state, not the View's stale instance
+            round_data = fresh_state.play_round(player1_position, player2_position)
 
             # DO NOT clear last_player1_position here - keep it so we can verify it was used correctly
             # It will be cleared when Player 1 makes their NEXT selection
 
             # CRITICAL: Save updated match state to Redis after round is played
-            await self.cog._save_match_state(match_channel.id, self.match_state)
+            await self.cog._save_match_state(match_channel.id, fresh_state)
 
-            # CRITICAL: Get fresh match state from Redis to ensure next dropdown is built with latest state
+            # CRITICAL: Get fresh match state AGAIN from Redis to ensure we have the absolute latest state
             fresh_state = await self.cog._get_match_state(match_channel.id)
             if not fresh_state:
                 logger.error("Failed to retrieve fresh match state after saving!")
@@ -345,6 +356,9 @@ class PlayerSelectView(discord.ui.View):
                 await self.cog._complete_match(interaction, fresh_state, match_channel)
             else:
                 # Use centralized turn announcement
+                logger.info(
+                    f"Round {fresh_state.current_round - 1} complete. Announcing next turn for Round {fresh_state.current_round}, Player {1 if fresh_state.current_turn == fresh_state.player1_id else 2}"
+                )
                 await self.cog._announce_turn(match_channel.id, fresh_state)
 
 
@@ -388,6 +402,9 @@ class MatchCog(commands.Cog):
             logger.error(f"Cannot announce turn: channel {channel_id} not found")
             return
 
+        logger.info(
+            f"ANNOUNCING TURN: Round {match_state.current_round}, User {next_id} (Player {1 if next_id == match_state.player1_id else 2})"
+        )
         await channel.send(
             f"⏳ **Round {match_state.current_round}** - <@{next_id}>, it's your turn! Check your DMs!"
         )
@@ -884,6 +901,7 @@ class MatchCog(commands.Cog):
                 )
 
                 # Remove active match - handle multiple matches if they exist
+                # Delete by channel ID first
                 channel_id = (
                     match_channel.id if match_channel else interaction.channel_id
                 )
@@ -893,6 +911,25 @@ class MatchCog(commands.Cog):
                 active_matches = result.scalars().all()
                 for active in active_matches:
                     await session.delete(active)
+
+                # Also delete any matches involving these players in other channels (cleanup)
+                result = await session.execute(
+                    select(ActiveMatch).where(
+                        or_(
+                            ActiveMatch.player1_id == match_state.player1_id,
+                            ActiveMatch.player2_id == match_state.player1_id,
+                            ActiveMatch.player1_id == match_state.player2_id,
+                            ActiveMatch.player2_id == match_state.player2_id,
+                        )
+                    )
+                )
+                player_matches = result.scalars().all()
+                if player_matches:
+                    logger.warning(
+                        f"Found {len(player_matches)} additional active matches for these players. Cleaning up..."
+                    )
+                    for active in player_matches:
+                        await session.delete(active)
 
                 # Process any active bets BEFORE committing
                 bet_results = await self._process_bets(

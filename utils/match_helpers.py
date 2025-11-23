@@ -34,21 +34,34 @@ async def is_user_in_active_match(
                 )
             )
         )
-        active_match = result.scalar_one_or_none()
+        active_matches = result.scalars().all()
 
-        if active_match:
-            logger.info(
-                f"User {user_id} is in active match in channel {active_match.channel_id}"
+        if not active_matches:
+            return False, None
+
+        # If multiple active matches found (shouldn't happen), clean up and use first
+        if len(active_matches) > 1:
+            logger.warning(
+                f"Found {len(active_matches)} active matches for user {user_id}! Cleaning up duplicates..."
             )
-            return True, active_match.channel_id
+            # Keep the first one, delete the rest
+            for match in active_matches[1:]:
+                await session.delete(match)
+            await session.commit()
+            logger.info(
+                f"Cleaned up {len(active_matches) - 1} duplicate active matches"
+            )
 
-        return False, None
+        active_match = active_matches[0]
+        logger.info(
+            f"User {user_id} is in active match in channel {active_match.channel_id}"
+        )
+        return True, active_match.channel_id
 
     except Exception as e:
         logger.error(
             f"Error checking active match for user {user_id}: {e}", exc_info=True
         )
-        # On error, allow the action (fail open to avoid blocking legitimate actions)
         return False, None
 
 
