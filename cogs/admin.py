@@ -514,12 +514,50 @@ class AdminCog(commands.Cog):
                 "❌ An error occurred while giving club cards.", ephemeral=True
             )
 
+    @give_club.autocomplete("club_name")
+    async def club_name_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        """Autocomplete for club names"""
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get distinct club names
+                query = select(Card.club).distinct().where(Card.club.isnot(None))
+                if current:
+                    query = query.where(Card.club.ilike(f"%{current}%"))
+                query = query.limit(25)
+
+                result = await session.execute(query)
+                clubs = result.scalars().all()
+
+                return [
+                    app_commands.Choice(name=club, value=club) for club in clubs if club
+                ]
+        except Exception as e:
+            logger.error(f"Error in club_name_autocomplete: {e}", exc_info=True)
+            return []
+
     @app_commands.command(
         name="give_event", description="[ADMIN] Give all cards from an event"
     )
     @app_commands.describe(
         user="The user to give cards to",
-        event_type="Type of event (TOTW, TOTS, TOTY, etc.)",
+        event_type="Type of event",
+    )
+    @app_commands.choices(
+        event_type=[
+            app_commands.Choice(name="Team of the Week (TOTW)", value="TOTW"),
+            app_commands.Choice(name="Team of the Season (TOTS)", value="TOTS"),
+            app_commands.Choice(name="Team of the Year (TOTY)", value="TOTY"),
+            app_commands.Choice(name="UEFA Champions League (UCL)", value="UCL"),
+            app_commands.Choice(name="UEFA Europa League (UEL)", value="UEL"),
+            app_commands.Choice(name="International", value="International"),
+            app_commands.Choice(name="Special", value="Special"),
+            app_commands.Choice(name="Ballon d'Or", value="Ballon d'Or"),
+            app_commands.Choice(name="Summer Stars", value="Summer Stars"),
+            app_commands.Choice(name="Flashback", value="Flashback"),
+            app_commands.Choice(name="Boxing Day", value="Boxing Day"),
+        ]
     )
     @app_commands.check(is_admin_check)
     async def give_event(
@@ -810,6 +848,28 @@ class AdminCog(commands.Cog):
                 "❌ An error occurred while adding the promo code.", ephemeral=True
             )
 
+    @promo_add.autocomplete("reward_type")
+    async def promo_reward_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        """Autocomplete for promo reward types"""
+        choices = [
+            app_commands.Choice(
+                name="Daily Pack (Base Players)", value="pack_daily_pack"
+            ),
+            app_commands.Choice(name="Weekly Pack (Icons)", value="pack_weekly_pack"),
+            app_commands.Choice(name="Event Pack", value="pack_event_pack"),
+            app_commands.Choice(
+                name="Premium Pack (Icon/Event)", value="pack_premium_pack"
+            ),
+            app_commands.Choice(name="Booster Pack (Base)", value="pack_booster_pack"),
+        ]
+
+        if current:
+            current_lower = current.lower()
+            return [c for c in choices if current_lower in c.name.lower()]
+        return choices
+
     @app_commands.command(
         name="promo_remove", description="[ADMIN] Remove a promo code"
     )
@@ -850,6 +910,32 @@ class AdminCog(commands.Cog):
             await interaction.followup.send(
                 "❌ An error occurred while removing the promo code.", ephemeral=True
             )
+
+    @promo_remove.autocomplete("code")
+    async def promo_remove_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        """Autocomplete for promo codes"""
+        try:
+            async with AsyncSessionLocal() as session:
+                query = select(PromoCode)
+                if current:
+                    query = query.where(PromoCode.code.ilike(f"%{current}%"))
+                query = query.limit(25)
+
+                result = await session.execute(query)
+                promos = result.scalars().all()
+
+                return [
+                    app_commands.Choice(
+                        name=f"{promo.code} - {promo.reward.get('type', 'unknown')}",
+                        value=promo.code,
+                    )
+                    for promo in promos
+                ]
+        except Exception as e:
+            logger.error(f"Error in promo_remove_autocomplete: {e}", exc_info=True)
+            return []
 
     @app_commands.command(name="logo_add", description="[ADMIN] Add a logo to the game")
     @app_commands.describe(
@@ -943,6 +1029,31 @@ class AdminCog(commands.Cog):
             await interaction.followup.send(
                 "❌ An error occurred while removing the logo.", ephemeral=True
             )
+
+    @logo_remove.autocomplete("name")
+    async def logo_remove_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        """Autocomplete for logo names"""
+        try:
+            async with AsyncSessionLocal() as session:
+                query = select(Logo)
+                if current:
+                    query = query.where(Logo.name.ilike(f"%{current}%"))
+                query = query.limit(25)
+
+                result = await session.execute(query)
+                logos = result.scalars().all()
+
+                return [
+                    app_commands.Choice(
+                        name=f"{logo.name} (+{logo.bonus} OVR)", value=logo.name
+                    )
+                    for logo in logos
+                ]
+        except Exception as e:
+            logger.error(f"Error in logo_remove_autocomplete: {e}", exc_info=True)
+            return []
 
     @app_commands.command(
         name="admin_manage",

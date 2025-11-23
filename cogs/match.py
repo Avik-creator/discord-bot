@@ -521,10 +521,12 @@ class MatchCog(commands.Cog):
             logger.error(f"Error sending player pick menu: {e}", exc_info=True)
 
     async def _get_team_data(
-        self, session: AsyncSession, user_id: int
+        self, session: AsyncSession, user_id: int, guild_id: int
     ) -> tuple[Optional[Team], Dict]:
         """Get team and slots for a user"""
-        result = await session.execute(select(Team).where(Team.user_id == user_id))
+        result = await session.execute(
+            select(Team).where(Team.user_id == user_id).where(Team.guild_id == guild_id)
+        )
         team = result.scalar_one_or_none()
 
         if not team or not team.formation:
@@ -646,10 +648,10 @@ class MatchCog(commands.Cog):
 
                 # Get both teams
                 player1_team, player1_slots = await self._get_team_data(
-                    session, interaction.user.id
+                    session, interaction.user.id, interaction.guild.id
                 )
                 player2_team, player2_slots = await self._get_team_data(
-                    session, opponent.id
+                    session, opponent.id, interaction.guild.id
                 )
 
                 if not player1_team or not player1_slots:

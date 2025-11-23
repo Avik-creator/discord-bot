@@ -411,6 +411,39 @@ class CollectionCog(commands.Cog):
                 "❌ An error occurred while loading your collection.", ephemeral=True
             )
 
+    @view_collection.autocomplete("event_filter")
+    async def event_filter_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        """Autocomplete for event filter"""
+        try:
+            async with AsyncSessionLocal() as session:
+                # Get distinct event types from user's collection
+                query = (
+                    select(Card.event_type)
+                    .distinct()
+                    .join(Collection, Card.id == Collection.card_id)
+                    .where(Collection.user_id == interaction.user.id)
+                    .where(Card.event_type.isnot(None))
+                )
+
+                if current:
+                    query = query.where(Card.event_type.ilike(f"%{current}%"))
+
+                query = query.limit(25)
+
+                result = await session.execute(query)
+                event_types = result.scalars().all()
+
+                return [
+                    app_commands.Choice(name=event_type, value=event_type)
+                    for event_type in event_types
+                    if event_type
+                ]
+        except Exception as e:
+            logger.error(f"Error in event_filter_autocomplete: {e}", exc_info=True)
+            return []
+
     @app_commands.command(name="show", description="Display a specific card in detail")
     @app_commands.describe(player_name="Name of the player to show")
     async def show_card(self, interaction: discord.Interaction, player_name: str):

@@ -9,7 +9,7 @@ from sqlalchemy.orm import selectinload
 
 import config
 from database.database import AsyncSessionLocal
-from database.models import Card, Collection, Logo, Team, TeamSlot, User
+from database.models import Bet, Card, Collection, Logo, Team, TeamSlot, User
 from utils.embeds import EmbedBuilder
 from utils.formations import FormationManager
 from utils.match_helpers import is_user_in_active_match
@@ -383,6 +383,36 @@ class TeamCog(commands.Cog):
                             ephemeral=True,
                         )
                         return
+
+                    # CHECK IF CARD IS CURRENTLY IN AN ACTIVE BET (both pending and accepted)
+                    result = await session.execute(
+                        select(Bet)
+                        .where(Bet.guild_id == interaction.guild.id)
+                        .where(Bet.completed == False)
+                        .where(
+                            (Bet.creator_id == interaction.user.id)
+                            | (Bet.challenged_id == interaction.user.id)
+                        )
+                    )
+                    active_bets = result.scalars().all()
+
+                    for bet in active_bets:
+                        if bet.creator_id == interaction.user.id:
+                            if card.id in (bet.creator_cards or []):
+                                await interaction.followup.send(
+                                    f"❌ **{card.name}** is currently in an active bet!\n"
+                                    f"You cannot add cards to your team that are being bet. Cancel or complete the bet first.",
+                                    ephemeral=True,
+                                )
+                                return
+                        if bet.challenged_id == interaction.user.id:
+                            if card.id in (bet.challenged_cards or []):
+                                await interaction.followup.send(
+                                    f"❌ **{card.name}** is currently in an active bet!\n"
+                                    f"You cannot add cards to your team that are being bet. Cancel or complete the bet first.",
+                                    ephemeral=True,
+                                )
+                                return
 
                     # CHECK IF CARD IS ALREADY USED IN ANOTHER SLOT
                     result = await session.execute(
