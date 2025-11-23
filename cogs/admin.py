@@ -518,21 +518,53 @@ class AdminCog(commands.Cog):
     async def club_name_autocomplete(
         self, interaction: discord.Interaction, current: str
     ):
-        """Autocomplete for club names"""
+        """Autocomplete for club names with smart filtering"""
         try:
             async with AsyncSessionLocal() as session:
                 # Get distinct club names
                 query = select(Card.club).distinct().where(Card.club.isnot(None))
-                if current:
+
+                # If user hasn't typed anything, get top 25 clubs by card count
+                if not current or not current.strip():
+                    # Get clubs with most cards (more popular clubs first)
+                    from sqlalchemy import func
+
+                    query = (
+                        select(Card.club, func.count(Card.id).label("card_count"))
+                        .where(Card.club.isnot(None))
+                        .group_by(Card.club)
+                        .order_by(func.count(Card.id).desc())
+                        .limit(25)
+                    )
+                    result = await session.execute(query)
+                    clubs = [row[0] for row in result.all()]
+                else:
+                    # Get all matching clubs for smart sorting
                     query = query.where(Card.club.ilike(f"%{current}%"))
-                query = query.limit(25)
+                    result = await session.execute(query)
+                    all_clubs = [club for club in result.scalars().all() if club]
 
-                result = await session.execute(query)
-                clubs = result.scalars().all()
+                    # Smart sorting: exact match > starts with > contains
+                    current_lower = current.lower()
+                    exact_matches = [c for c in all_clubs if c.lower() == current_lower]
+                    starts_with = [
+                        c
+                        for c in all_clubs
+                        if c.lower().startswith(current_lower)
+                        and c not in exact_matches
+                    ]
+                    contains = [
+                        c
+                        for c in all_clubs
+                        if current_lower in c.lower()
+                        and c not in exact_matches
+                        and c not in starts_with
+                    ]
 
-                return [
-                    app_commands.Choice(name=club, value=club) for club in clubs if club
-                ]
+                    # Combine and limit to 25
+                    clubs = (exact_matches + starts_with + contains)[:25]
+
+                return [app_commands.Choice(name=club, value=club) for club in clubs]
         except Exception as e:
             logger.error(f"Error in club_name_autocomplete: {e}", exc_info=True)
             return []
@@ -852,7 +884,7 @@ class AdminCog(commands.Cog):
     async def promo_reward_autocomplete(
         self, interaction: discord.Interaction, current: str
     ):
-        """Autocomplete for promo reward types"""
+        """Autocomplete for promo reward types with smart filtering"""
         choices = [
             app_commands.Choice(
                 name="Daily Pack (Base Players)", value="pack_daily_pack"
@@ -865,10 +897,19 @@ class AdminCog(commands.Cog):
             app_commands.Choice(name="Booster Pack (Base)", value="pack_booster_pack"),
         ]
 
-        if current:
-            current_lower = current.lower()
-            return [c for c in choices if current_lower in c.name.lower()]
-        return choices
+        if not current or not current.strip():
+            return choices
+
+        # Smart filtering: prioritize matches at start of string
+        current_lower = current.lower()
+        starts_with = [c for c in choices if c.name.lower().startswith(current_lower)]
+        contains = [
+            c
+            for c in choices
+            if current_lower in c.name.lower() and c not in starts_with
+        ]
+
+        return (starts_with + contains)[:25]
 
     @app_commands.command(
         name="promo_remove", description="[ADMIN] Remove a promo code"
@@ -915,16 +956,40 @@ class AdminCog(commands.Cog):
     async def promo_remove_autocomplete(
         self, interaction: discord.Interaction, current: str
     ):
-        """Autocomplete for promo codes"""
+        """Autocomplete for promo codes with smart filtering"""
         try:
             async with AsyncSessionLocal() as session:
+                # Get all promo codes (or filtered if user typed something)
                 query = select(PromoCode)
-                if current:
+                if current and current.strip():
                     query = query.where(PromoCode.code.ilike(f"%{current}%"))
-                query = query.limit(25)
 
                 result = await session.execute(query)
-                promos = result.scalars().all()
+                all_promos = result.scalars().all()
+
+                if not current or not current.strip():
+                    # Show most recent promos first
+                    promos = sorted(
+                        all_promos, key=lambda p: p.created_at, reverse=True
+                    )[:25]
+                else:
+                    # Smart sorting: exact match > starts with > contains
+                    current_upper = current.upper()
+                    exact = [p for p in all_promos if p.code == current_upper]
+                    starts = [
+                        p
+                        for p in all_promos
+                        if p.code.startswith(current_upper) and p not in exact
+                    ]
+                    contains = [
+                        p
+                        for p in all_promos
+                        if current_upper in p.code
+                        and p not in exact
+                        and p not in starts
+                    ]
+
+                    promos = (exact + starts + contains)[:25]
 
                 return [
                     app_commands.Choice(
@@ -1034,16 +1099,49 @@ class AdminCog(commands.Cog):
     async def logo_remove_autocomplete(
         self, interaction: discord.Interaction, current: str
     ):
-        """Autocomplete for logo names"""
+        """Autocomplete for logo names with smart filtering"""
         try:
             async with AsyncSessionLocal() as session:
                 query = select(Logo)
-                if current:
+                if current and current.strip():
                     query = query.where(Logo.name.ilike(f"%{current}%"))
-                query = query.limit(25)
 
                 result = await session.execute(query)
-                logos = result.scalars().all()
+                all_logos = result.scalars().all()
+
+                if not current or not current.strip():
+                    # Sort by rarity (legendary > rare > common) then alphabetically
+                    rarity_order = {"legendary": 0, "rare": 1, "common": 2}
+                    logos = sorted(
+                        all_logos,
+                        key=lambda l: (
+                            rarity_order.get(
+                                l.rarity.value
+                                if hasattr(l.rarity, "value")
+                                else l.rarity,
+                                3,
+                            ),
+                            l.name,
+                        ),
+                    )[:25]
+                else:
+                    # Smart sorting: exact match > starts with > contains
+                    current_lower = current.lower()
+                    exact = [l for l in all_logos if l.name.lower() == current_lower]
+                    starts = [
+                        l
+                        for l in all_logos
+                        if l.name.lower().startswith(current_lower) and l not in exact
+                    ]
+                    contains = [
+                        l
+                        for l in all_logos
+                        if current_lower in l.name.lower()
+                        and l not in exact
+                        and l not in starts
+                    ]
+
+                    logos = (exact + starts + contains)[:25]
 
                 return [
                     app_commands.Choice(

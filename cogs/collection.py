@@ -415,7 +415,7 @@ class CollectionCog(commands.Cog):
     async def event_filter_autocomplete(
         self, interaction: discord.Interaction, current: str
     ):
-        """Autocomplete for event filter"""
+        """Autocomplete for event filter with smart filtering"""
         try:
             async with AsyncSessionLocal() as session:
                 # Get distinct event types from user's collection
@@ -427,18 +427,37 @@ class CollectionCog(commands.Cog):
                     .where(Card.event_type.isnot(None))
                 )
 
-                if current:
+                if current and current.strip():
                     query = query.where(Card.event_type.ilike(f"%{current}%"))
 
-                query = query.limit(25)
-
                 result = await session.execute(query)
-                event_types = result.scalars().all()
+                all_event_types = [et for et in result.scalars().all() if et]
+
+                if not current or not current.strip():
+                    # Show all event types alphabetically
+                    event_types = sorted(all_event_types)[:25]
+                else:
+                    # Smart sorting: exact match > starts with > contains
+                    current_lower = current.lower()
+                    exact = [e for e in all_event_types if e.lower() == current_lower]
+                    starts = [
+                        e
+                        for e in all_event_types
+                        if e.lower().startswith(current_lower) and e not in exact
+                    ]
+                    contains = [
+                        e
+                        for e in all_event_types
+                        if current_lower in e.lower()
+                        and e not in exact
+                        and e not in starts
+                    ]
+
+                    event_types = (exact + starts + contains)[:25]
 
                 return [
                     app_commands.Choice(name=event_type, value=event_type)
                     for event_type in event_types
-                    if event_type
                 ]
         except Exception as e:
             logger.error(f"Error in event_filter_autocomplete: {e}", exc_info=True)

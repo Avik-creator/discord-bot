@@ -681,7 +681,7 @@ class TeamCog(commands.Cog):
     async def player_name_autocomplete(
         self, interaction: discord.Interaction, current: str
     ):
-        """Autocomplete player names from user's collection, sorted by position compatibility and OVR"""
+        """Autocomplete player names from user's collection with smart filtering"""
         if not current:
             current = ""
 
@@ -735,41 +735,78 @@ class TeamCog(commands.Cog):
                 if query:
                     base_query = base_query.where(Card.name.ilike(f"%{query}%"))
 
-                # If position is selected, prioritize compatible positions
-                if selected_position and selected_position in position_compatibility:
+                # Get all matching cards (we'll sort them smartly)
+                result = await session.execute(base_query)
+                all_cards = result.scalars().all()
+
+                # Smart sorting with multiple criteria
+                if query and all_cards:
+                    # Separate by match quality
+                    exact_matches = [c for c in all_cards if c.name.lower() == query]
+                    starts_with = [
+                        c
+                        for c in all_cards
+                        if c.name.lower().startswith(query) and c not in exact_matches
+                    ]
+                    contains = [
+                        c
+                        for c in all_cards
+                        if query in c.name.lower()
+                        and c not in exact_matches
+                        and c not in starts_with
+                    ]
+
+                    # If position is selected, further prioritize compatible positions
+                    if (
+                        selected_position
+                        and selected_position in position_compatibility
+                    ):
+                        compatible_positions = position_compatibility.get(
+                            selected_position, [selected_position]
+                        )
+
+                        def sort_key(card):
+                            is_compatible = card.position in compatible_positions
+                            return (
+                                not is_compatible,  # Compatible positions first
+                                -card.overall_rating,  # Higher OVR first
+                                card.name,  # Alphabetical
+                            )
+
+                        exact_matches.sort(key=sort_key)
+                        starts_with.sort(key=sort_key)
+                        contains.sort(key=sort_key)
+                    else:
+                        # Just sort by OVR and name
+                        def sort_key(card):
+                            return (-card.overall_rating, card.name)
+
+                        exact_matches.sort(key=sort_key)
+                        starts_with.sort(key=sort_key)
+                        contains.sort(key=sort_key)
+
+                    cards = (exact_matches + starts_with + contains)[:25]
+                elif selected_position and selected_position in position_compatibility:
+                    # No query but position selected - show compatible first
                     compatible_positions = position_compatibility.get(
                         selected_position, [selected_position]
                     )
+                    compatible = [
+                        c for c in all_cards if c.position in compatible_positions
+                    ]
+                    other = [
+                        c for c in all_cards if c.position not in compatible_positions
+                    ]
 
-                    # First try to get compatible cards
-                    compatible_query = (
-                        base_query.where(Card.position.in_(compatible_positions))
-                        .order_by(Card.overall_rating.desc(), Card.name)
-                        .limit(25)
-                    )
+                    compatible.sort(key=lambda c: (-c.overall_rating, c.name))
+                    other.sort(key=lambda c: (-c.overall_rating, c.name))
 
-                    result = await session.execute(compatible_query)
-                    cards = result.scalars().all()
-
-                    # If we don't have enough, add some from other positions
-                    if len(cards) < 25:
-                        other_query = (
-                            base_query.where(~Card.position.in_(compatible_positions))
-                            .order_by(Card.overall_rating.desc(), Card.name)
-                            .limit(25 - len(cards))
-                        )
-
-                        result = await session.execute(other_query)
-                        other_cards = result.scalars().all()
-                        cards = list(cards) + list(other_cards)
+                    cards = (compatible + other)[:25]
                 else:
-                    # No position filter, just get top cards
-                    base_query = base_query.order_by(
-                        Card.overall_rating.desc(), Card.name
-                    ).limit(25)
-
-                    result = await session.execute(base_query)
-                    cards = result.scalars().all()
+                    # No query, no position - just show best cards
+                    cards = sorted(
+                        all_cards, key=lambda c: (-c.overall_rating, c.name)
+                    )[:25]
 
                 # Build suggestions
                 suggestions = []
