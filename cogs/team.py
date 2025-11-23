@@ -12,6 +12,7 @@ from database.database import AsyncSessionLocal
 from database.models import Card, Collection, Logo, Team, TeamSlot, User
 from utils.embeds import EmbedBuilder
 from utils.formations import FormationManager
+from utils.match_helpers import is_user_in_active_match
 
 logger = logging.getLogger("discord_bot")
 
@@ -87,6 +88,18 @@ class TeamCog(commands.Cog):
 
         try:
             async with AsyncSessionLocal() as session:
+                # Check if user is in an active match
+                is_in_match, channel_id = await is_user_in_active_match(
+                    session, interaction.user.id
+                )
+                if is_in_match:
+                    await interaction.followup.send(
+                        f"⚠️ You cannot change your formation while in an active match!\n"
+                        f"Please complete your match in <#{channel_id}> first.",
+                        ephemeral=True,
+                    )
+                    return
+
                 result = await session.execute(
                     select(Team)
                     .where(Team.user_id == interaction.user.id)
@@ -238,6 +251,18 @@ class TeamCog(commands.Cog):
 
         try:
             async with AsyncSessionLocal() as session:
+                # Check if user is in an active match
+                is_in_match, channel_id = await is_user_in_active_match(
+                    session, interaction.user.id
+                )
+                if is_in_match:
+                    await interaction.followup.send(
+                        f"⚠️ You cannot modify your team while in an active match!\n"
+                        f"Please complete your match in <#{channel_id}> first.",
+                        ephemeral=True,
+                    )
+                    return
+
                 # Get team WITH GUILD ISOLATION
                 result = await session.execute(
                     select(Team)
@@ -750,7 +775,20 @@ class TeamCog(commands.Cog):
 
         try:
             async with AsyncSessionLocal() as session:
-                # Load team with logo relationship WITH GUILD ISOLATION
+                # Check if user is in an active match (only for add/remove actions)
+                if action in ["add", "remove"]:
+                    is_in_match, channel_id = await is_user_in_active_match(
+                        session, interaction.user.id
+                    )
+                    if is_in_match:
+                        await interaction.followup.send(
+                            f"⚠️ You cannot change your logo while in an active match!\n"
+                            f"Please complete your match in <#{channel_id}> first.",
+                            ephemeral=True,
+                        )
+                        return
+
+                # Load team with logo relationship WITH GUILD ISOLATION</parameter>
                 result = await session.execute(
                     select(Team)
                     .options(selectinload(Team.logo))

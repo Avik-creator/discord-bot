@@ -22,6 +22,7 @@ from database.models import (
 )
 from utils.embeds import EmbedBuilder
 from utils.match_engine import MatchEngine, MatchState
+from utils.match_helpers import is_user_in_active_match
 from utils.redis_manager import redis_manager
 
 logger = logging.getLogger("discord_bot")
@@ -619,6 +620,30 @@ class MatchCog(commands.Cog):
 
         try:
             async with AsyncSessionLocal() as session:
+                # Check if challenger is already in an active match
+                is_in_match, channel_id = await is_user_in_active_match(
+                    session, interaction.user.id
+                )
+                if is_in_match:
+                    await interaction.followup.send(
+                        f"⚠️ You are already in an active match in <#{channel_id}>!\n"
+                        f"Please complete that match before starting a new one.",
+                        ephemeral=True,
+                    )
+                    return
+
+                # Check if opponent is already in an active match
+                is_in_match, channel_id = await is_user_in_active_match(
+                    session, opponent.id
+                )
+                if is_in_match:
+                    await interaction.followup.send(
+                        f"⚠️ {opponent.mention} is already in an active match in <#{channel_id}>!\n"
+                        f"Please wait until their match is complete.",
+                        ephemeral=True,
+                    )
+                    return
+
                 # Get both teams
                 player1_team, player1_slots = await self._get_team_data(
                     session, interaction.user.id
@@ -1203,6 +1228,30 @@ class MatchCog(commands.Cog):
 
         try:
             async with AsyncSessionLocal() as session:
+                # Check if user is already in an active match
+                is_in_match, channel_id = await is_user_in_active_match(
+                    session, interaction.user.id
+                )
+                if is_in_match:
+                    await interaction.followup.send(
+                        f"⚠️ You cannot create or modify bets while in an active match!\n"
+                        f"Please complete your match in <#{channel_id}> first.",
+                        ephemeral=True,
+                    )
+                    return
+
+                # Check if opponent is already in an active match
+                is_in_match, channel_id = await is_user_in_active_match(
+                    session, opponent.id
+                )
+                if is_in_match:
+                    await interaction.followup.send(
+                        f"⚠️ {opponent.mention} is already in an active match in <#{channel_id}>!\n"
+                        f"You cannot bet with them until their match is complete.",
+                        ephemeral=True,
+                    )
+                    return
+
                 # Find card in collection
                 result = await session.execute(
                     select(Card, Collection)
@@ -1220,6 +1269,24 @@ class MatchCog(commands.Cog):
                     return
 
                 card, _ = card_data
+
+                # Check if card is currently in user's team lineup
+                result = await session.execute(
+                    select(TeamSlot)
+                    .join(Team, TeamSlot.team_id == Team.id)
+                    .where(Team.user_id == interaction.user.id)
+                    .where(Team.guild_id == interaction.guild.id)
+                    .where(TeamSlot.card_id == card.id)
+                )
+                team_slot = result.scalar_one_or_none()
+
+                if team_slot:
+                    await interaction.followup.send(
+                        f"❌ **{card.name}** is currently in your team lineup!\n"
+                        f"You cannot bet cards that are in your active team. Remove it from your team first.",
+                        ephemeral=True,
+                    )
+                    return
 
                 # Check for existing bet where user is creator
                 result = await session.execute(
