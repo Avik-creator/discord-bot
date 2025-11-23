@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+from functools import wraps
 
 import discord
 from discord import app_commands
@@ -25,6 +26,27 @@ from utils.match_helpers import is_user_in_active_match
 
 # Create module-level logger
 logger = logging.getLogger("discord_bot")
+
+
+def admin_command(func):
+    """Decorator that defers the interaction first, then checks admin status"""
+
+    @wraps(func)
+    async def wrapper(self, interaction: discord.Interaction, *args, **kwargs):
+        # Defer FIRST to prevent timeout (within 3 seconds)
+        await interaction.response.defer(ephemeral=False)
+
+        # Check admin status AFTER deferring
+        if not await is_admin_check(interaction):
+            await interaction.followup.send(
+                "❌ You don't have permission to use this command!", ephemeral=True
+            )
+            return
+
+        # Call the original command
+        return await func(self, interaction, *args, **kwargs)
+
+    return wrapper
 
 
 async def is_admin_check(interaction: discord.Interaction) -> bool:
@@ -305,13 +327,11 @@ class AdminCog(commands.Cog):
     @app_commands.describe(
         user="The user to give the card to", card_name="Name of the card"
     )
-    @app_commands.check(is_admin_check)
+    @admin_command
     async def give_user_card(
         self, interaction: discord.Interaction, user: discord.Member, card_name: str
     ):
         """give_user_card"""
-        await interaction.response.defer(ephemeral=False)
-
         try:
             async with AsyncSessionLocal() as session:
                 # Check if user is in an active match
@@ -763,17 +783,9 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="promo_add", description="[ADMIN] Add a promo code")
     @app_commands.describe(
         code="The promo code",
-        reward_type="Type of reward",
+        reward_type="Type of reward (use autocomplete)",
         card_name="Card name (if reward is a card)",
         max_uses="Maximum number of uses (optional)",
-    )
-    @app_commands.choices(
-        reward_type=[
-            app_commands.Choice(name="Random Base Card", value="pack_base"),
-            app_commands.Choice(name="Random Icon Card", value="pack_icon"),
-            app_commands.Choice(name="Random Event Card", value="pack_event"),
-            app_commands.Choice(name="Specific Card", value="card"),
-        ]
     )
     @app_commands.check(is_admin_check)
     async def promo_add(
@@ -886,6 +898,7 @@ class AdminCog(commands.Cog):
     ):
         """Autocomplete for promo reward types with smart filtering"""
         choices = [
+            app_commands.Choice(name="Specific Card", value="card"),
             app_commands.Choice(
                 name="Daily Pack (Base Players)", value="pack_daily_pack"
             ),
@@ -910,6 +923,38 @@ class AdminCog(commands.Cog):
         ]
 
         return (starts_with + contains)[:25]
+
+    @promo_add.autocomplete("card_name")
+    async def promo_card_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        """Autocomplete for card names in promo codes"""
+        if not current or len(current) < 2:
+            return []
+
+        try:
+            async with AsyncSessionLocal() as session:
+                # Search for cards matching the input
+                result = await session.execute(
+                    select(Card)
+                    .where(Card.name.ilike(f"%{current}%"))
+                    .order_by(Card.overall_rating.desc())
+                    .limit(25)
+                )
+                cards = result.scalars().all()
+
+                choices = [
+                    app_commands.Choice(
+                        name=f"{card.name} ({card.overall_rating} OVR - {card.position})",
+                        value=card.name,
+                    )
+                    for card in cards
+                ]
+
+                return choices[:25]
+        except Exception as e:
+            logger.error(f"Error in card autocomplete: {e}")
+            return []
 
     @app_commands.command(
         name="promo_remove", description="[ADMIN] Remove a promo code"
